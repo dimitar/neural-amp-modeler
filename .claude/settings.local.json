@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git check-ignore:*)",
+      "Bash(ls:*)",
+      "Bash(git log:*)",
+      "Bash(python -c:*)",
+      "Bash(taskkill:*)",
+      "Bash(tasklist:*)",
+      "Bash(bash /c/Users/dimit/source/neural-amp-modeler/slack_notify.sh \"Slack webhook configured. You''ll receive training updates at epochs 10, 15, 30, 60, 100, 200, and completion.\")"
+    ]
+  }
+}

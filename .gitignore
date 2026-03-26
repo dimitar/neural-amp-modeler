@@ -139,3 +139,12 @@ nam/train/gui/_resources/settings.json
 
 # Resources downloaded into tests/
 tests/resources/*.reapeaks
+*.wav
+*.ckpt
+*.pt
+*.nam
+
+# Training outputs and data
+parametric_output/
+parametric_output_small_test/
+data/
