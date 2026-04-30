@@ -13,11 +13,13 @@ Usage:
 
 import argparse
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pytorch_lightning as pl
+import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,7 +36,6 @@ SAMPLE_RATE = 48_000
 DELAY_SAMPLES = 10
 TRAIN_SECONDS = 180
 
-CONDITION_SIZE = 32
 HEAD_SCALE = 0.02
 NY = 8192
 BATCH_SIZE = 16
@@ -44,6 +45,15 @@ MAX_EPOCHS = 250
 PRE_EMPH_COEF = 0.85
 
 LR_WARMUP_EPOCHS = 5  # Linear LR ramp-up over first N epochs
+
+# Model size presets. "small" is the production default per CLAUDE.md
+# (~26K params, ~0.007 ESR on 24 captures). "large" (~101K params) gives
+# only marginal improvement and is ~3-4x slower at inference.
+_MODEL_PRESETS = {
+    "small": {"channels": (16, 8), "condition_size": 16, "head_size": (8, 1)},
+    "large": {"channels": (32, 16), "condition_size": 32, "head_size": (16, 1)},
+}
+DEFAULT_MODEL_SIZE = "small"
 
 # (capture_number, OD1, OD2)
 # 5x5 grid: OD2 varies by group (2,4,6,8,10), OD1 varies within group.
@@ -83,28 +93,25 @@ _FILM_PARAMS = {
     "activation_pre_film": {"active": True, "shift": True},
 }
 
-LAYER_CONFIGS = [
-    {
-        "input_size": 1,
-        "condition_size": CONDITION_SIZE,
-        "head_size": 16,
-        "channels": 32,
+
+def _build_layer_configs(model_size):
+    """Build LAYER_CONFIGS for the given preset name."""
+    p = _MODEL_PRESETS[model_size]
+    ch1, ch2 = p["channels"]
+    cs = p["condition_size"]
+    hs1, hs2 = p["head_size"]
+    common = {
         "kernel_size": 3,
         "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
         "activation": "Tanh",
         "film_params": _FILM_PARAMS,
-    },
-    {
-        "input_size": 32,
-        "condition_size": CONDITION_SIZE,
-        "head_size": 1,
-        "channels": 16,
-        "kernel_size": 3,
-        "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-        "activation": "Tanh",
-        "film_params": _FILM_PARAMS,
-    },
-]
+    }
+    return [
+        {"input_size": 1, "condition_size": cs, "head_size": hs1,
+         "channels": ch1, **common},
+        {"input_size": ch1, "condition_size": cs, "head_size": hs2,
+         "channels": ch2, **common},
+    ]
 
 
 def normalize_params(od1, od2):
@@ -333,39 +340,127 @@ class ParametricLightningModule(pl.LightningModule):
 # ─── Data Loading ─────────────────────────────────────────────────────────────
 
 
-def load_data(data_dir, nx, ny_train=NY):
-    """Load all WAV files, apply delay correction, and create train/val datasets."""
+def _detect_capture_pattern(data_dir):
+    """Auto-detect the WAV filename pattern from the data directory."""
     data_dir = Path(data_dir)
+    # Try known patterns in order
+    patterns = [
+        "{cap_num} ADA MP-1 NAM.wav",
+        "{cap_num} ADA MP-1 PS2 96khz.wav",
+    ]
+    for pat in patterns:
+        test_path = data_dir / pat.format(cap_num=1)
+        if test_path.exists():
+            return pat
+    # Fallback: find any WAV starting with "1 "
+    for f in data_dir.glob("1 *.wav"):
+        if f.name != "input.wav":
+            # Extract pattern by replacing leading "1 " with "{cap_num} "
+            return "{cap_num} " + f.name[2:]
+    raise FileNotFoundError(
+        f"Cannot detect capture WAV pattern in {data_dir}. "
+        "Expected files like '1 ADA MP-1 NAM.wav'."
+    )
+
+
+def _resample_tensor(x, from_rate, to_rate):
+    """Resample a 1D tensor using linear interpolation."""
+    if from_rate == to_rate:
+        return x
+    ratio = to_rate / from_rate
+    new_len = int(len(x) * ratio)
+    # Use torch interpolate (expects [batch, channels, length])
+    x_3d = x.unsqueeze(0).unsqueeze(0)
+    resampled = F.interpolate(x_3d, size=new_len, mode="linear", align_corners=False)
+    return resampled.squeeze()
+
+
+def load_data(
+    data_dir,
+    nx,
+    ny_train=NY,
+    delay_samples=DELAY_SAMPLES,
+    train_stop_seconds=None,
+    val_start_seconds=None,
+):
+    """Load all WAV files, apply delay correction, and create train/val datasets.
+
+    Args:
+        train_stop_seconds: Where to stop training data. Negative values are
+            relative to end of file (e.g. -9.0 means stop 9s before end).
+            None uses TRAIN_SECONDS from start.
+        val_start_seconds: Where validation data starts. Negative values are
+            relative to end of file. None means immediately after training data.
+    """
+    data_dir = Path(data_dir)
+    cap_pattern = _detect_capture_pattern(data_dir)
+    print(f"Capture pattern: {cap_pattern}")
+
+    # Detect sample rates
+    input_info = sf.info(str(data_dir / "input.wav"))
+    first_cap_path = data_dir / cap_pattern.format(cap_num=PARAM_TABLE[0][0])
+    capture_info = sf.info(str(first_cap_path))
+    target_rate = capture_info.samplerate
+    print(f"Input sample rate: {input_info.samplerate} Hz")
+    print(f"Capture sample rate: {target_rate} Hz")
 
     x = wav_to_tensor(data_dir / "input.wav")
-    print(f"Loaded input: {len(x)} samples ({len(x) / SAMPLE_RATE:.1f}s)")
+    if input_info.samplerate != target_rate:
+        print(
+            f"Resampling input from {input_info.samplerate} Hz to {target_rate} Hz..."
+        )
+        x = _resample_tensor(x, input_info.samplerate, target_rate)
+    print(f"Input: {len(x)} samples ({len(x) / target_rate:.1f}s @ {target_rate} Hz)")
 
     ys = []
     params_list = []
     for cap_num, od1, od2 in PARAM_TABLE:
-        wav_path = data_dir / f"{cap_num} ADA MP-1 NAM.wav"
+        wav_path = data_dir / cap_pattern.format(cap_num=cap_num)
         y = wav_to_tensor(wav_path)
-        # Delay correction: output is 10 samples behind input
-        ys.append(y[DELAY_SAMPLES:])
+        # Delay correction: output is behind input by delay_samples
+        ys.append(y[delay_samples:])
         params_list.append(normalize_params(od1, od2))
 
-    x = x[:-DELAY_SAMPLES]
+    if delay_samples > 0:
+        x = x[:-delay_samples]
 
     for i, y in enumerate(ys):
         assert len(y) == len(x), (
             f"Capture {PARAM_TABLE[i][0]}: length {len(y)} != input length {len(x)}"
         )
 
-    train_stop = TRAIN_SECONDS * SAMPLE_RATE
-    val_len = len(x) - train_stop
-    print(f"Train: {TRAIN_SECONDS}s ({train_stop} samples)")
-    print(f"Val: {val_len / SAMPLE_RATE:.1f}s ({val_len} samples)")
+    total_samples = len(x)
+    total_seconds = total_samples / target_rate
+
+    # Compute train/val split
+    if train_stop_seconds is not None:
+        if train_stop_seconds < 0:
+            train_stop = total_samples + int(train_stop_seconds * target_rate)
+        else:
+            train_stop = int(train_stop_seconds * target_rate)
+    else:
+        train_stop = TRAIN_SECONDS * SAMPLE_RATE
+
+    if val_start_seconds is not None:
+        if val_start_seconds < 0:
+            val_start = total_samples + int(val_start_seconds * target_rate)
+        else:
+            val_start = int(val_start_seconds * target_rate)
+    else:
+        val_start = train_stop
+
+    train_seconds = train_stop / target_rate
+    val_seconds = (total_samples - val_start) / target_rate
+    print(f"Total: {total_seconds:.1f}s ({total_samples} samples)")
+    print(f"Train: {train_seconds:.1f}s ({train_stop} samples)")
+    print(f"Val: {val_seconds:.1f}s ({total_samples - val_start} samples)")
 
     train_ds = ParametricDataset(x, ys, params_list, nx, ny_train, 0, train_stop)
 
     # Validation: one chunk per capture covering the full validation segment
+    val_len = total_samples - val_start
     val_ny = val_len - nx + 1
-    val_ds = ParametricDataset(x, ys, params_list, nx, val_ny, train_stop, None)
+    val_ds = ParametricDataset(x, ys, params_list, nx, val_ny, val_start, None)
 
     print(
         f"Train: {len(train_ds)} items "
@@ -388,35 +483,106 @@ def load_data(data_dir, nx, ny_train=NY):
         num_workers=0,
         pin_memory=True,
     )
-    return train_loader, val_loader
+    return train_loader, val_loader, target_rate
 
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 
 
+class _MetricsLogger(pl.callbacks.Callback):
+    """Print compact per-epoch metrics with best-tracking and ETA."""
+
+    def __init__(self):
+        super().__init__()
+        self._best_val_loss = float("inf")
+        self._best_val_esr = float("inf")
+        self._best_loss_epoch = -1
+        self._best_esr_epoch = -1
+        self._epoch_start = None
+        self._epoch_durations = []
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._epoch_start = time.time()
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        m = trainer.callback_metrics
+        epoch = trainer.current_epoch
+
+        def _get(key):
+            v = m.get(key)
+            return float(v) if v is not None else None
+
+        val_loss = _get("val_loss")
+        val_esr = _get("val_ESR")
+        train_esr = _get("train_ESR_step") or _get("train_ESR")
+
+        if val_loss is not None and val_loss < self._best_val_loss:
+            self._best_val_loss = val_loss
+            self._best_loss_epoch = epoch
+        if val_esr is not None and val_esr < self._best_val_esr:
+            self._best_val_esr = val_esr
+            self._best_esr_epoch = epoch
+
+        elapsed = time.time() - self._epoch_start if self._epoch_start else 0.0
+        self._epoch_durations.append(elapsed)
+        recent = self._epoch_durations[-5:]
+        avg = sum(recent) / len(recent)
+        remaining = max(0, trainer.max_epochs - epoch - 1)
+        eta_s = int(avg * remaining)
+        eta_h, rem = divmod(eta_s, 3600)
+        eta_m = rem // 60
+
+        def _fmt(x):
+            return f"{x:.6f}" if x is not None else "--------"
+
+        print(
+            f"\n+- epoch {epoch:3d}/{trainer.max_epochs}  "
+            f"({elapsed:.0f}s, ETA {eta_h}h{eta_m:02d}m)\n"
+            f"|  val_loss : {_fmt(val_loss)}  "
+            f"(best {self._best_val_loss:.6f} @ epoch {self._best_loss_epoch})\n"
+            f"|  val_ESR  : {_fmt(val_esr)}  "
+            f"(best {self._best_val_esr:.6f} @ epoch {self._best_esr_epoch})\n"
+            f"|  train_ESR: {_fmt(train_esr)}\n"
+            f"+-",
+            flush=True,
+        )
+
+
 def do_train(args):
     """Train the parametric WaveNet model."""
+    preset = _MODEL_PRESETS[args.model_size]
+    layer_configs = _build_layer_configs(args.model_size)
+    print(f"Model size: {args.model_size} "
+          f"(channels={preset['channels']}, "
+          f"condition_size={preset['condition_size']}, "
+          f"head_size={preset['head_size']})")
     model = ParametricWaveNet(
-        layer_configs=LAYER_CONFIGS,
+        layer_configs=layer_configs,
         head_scale=HEAD_SCALE,
-        condition_size=CONDITION_SIZE,
+        condition_size=preset["condition_size"],
     )
 
-    # Resume from checkpoint for fine-tuning
-    if args.resume:
-        ckpt = torch.load(args.resume, weights_only=False)
+    # Fine-tune: load weights only, reset epoch counter
+    if args.finetune:
+        ckpt = torch.load(args.finetune, weights_only=False)
         state = {
             k.removeprefix("_model."): v
             for k, v in ckpt["state_dict"].items()
             if k.startswith("_model.")
         }
         model.load_state_dict(state)
-        print(f"Resumed from: {args.resume}")
+        print(f"Fine-tuning from: {args.finetune}")
 
     print(f"Receptive field: {model.receptive_field}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    train_loader, val_loader = load_data(args.data_dir, model.receptive_field)
+    train_loader, val_loader, target_rate = load_data(
+        args.data_dir,
+        model.receptive_field,
+        delay_samples=args.delay,
+        train_stop_seconds=args.train_stop_seconds,
+        val_start_seconds=args.val_start_seconds,
+    )
     lit_model = ParametricLightningModule(model, lr=args.lr)
 
     out_dir = Path(args.output_dir)
@@ -433,13 +599,17 @@ def do_train(args):
         max_epochs=args.epochs,
         accelerator="auto",
         devices=1,
-        callbacks=[checkpoint_cb],
+        callbacks=[checkpoint_cb, _MetricsLogger()],
         default_root_dir=str(out_dir),
         log_every_n_steps=50,
         gradient_clip_val=1.0,
     )
 
-    trainer.fit(lit_model, train_loader, val_loader)
+    # Resume: restore full state (weights, optimizer, epoch, LR scheduler)
+    ckpt_path = args.resume if args.resume else None
+    if ckpt_path:
+        print(f"Resuming from: {ckpt_path}")
+    trainer.fit(lit_model, train_loader, val_loader, ckpt_path=ckpt_path)
 
     # Load best checkpoint weights into model for the standalone .pt save
     if checkpoint_cb.best_model_path:
@@ -457,11 +627,13 @@ def do_train(args):
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "layer_configs": LAYER_CONFIGS,
+            "layer_configs": layer_configs,
             "head_config": None,
             "head_scale": HEAD_SCALE,
-            "condition_size": CONDITION_SIZE,
+            "condition_size": preset["condition_size"],
             "receptive_field": model.receptive_field,
+            "model_size": args.model_size,
+            "sample_rate": target_rate,
         },
         save_path,
     )
@@ -523,7 +695,7 @@ def _export_wavenet_weights(model):
     return weights
 
 
-def export_nam(model, output_path):
+def export_nam(model, output_path, sample_rate):
     """Export a trained ParametricWaveNet to .nam JSON format.
 
     Weight order: [param_encoder_weights..., wavenet_weights..., head_scale]
@@ -577,7 +749,7 @@ def export_nam(model, output_path):
             "head_scale": model._head_scale,
         },
         "weights": all_weights.detach().numpy().tolist(),
-        "sample_rate": SAMPLE_RATE,
+        "sample_rate": sample_rate,
     }
 
     output_path = Path(output_path)
@@ -604,7 +776,16 @@ def do_export(args):
         condition_size=ckpt["condition_size"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
-    export_nam(model, args.output)
+    sample_rate = ckpt.get("sample_rate")
+    if sample_rate is None:
+        if args.sample_rate is None:
+            raise SystemExit(
+                "Checkpoint has no sample_rate; pass --sample-rate explicitly "
+                "(e.g. --sample-rate 96000 for the ADA MP-1 96kHz captures)."
+            )
+        sample_rate = args.sample_rate
+    print(f"Sample rate: {sample_rate} Hz")
+    export_nam(model, args.output, sample_rate)
     print(f"\nTo load in C++, parse param_encoder weights first ({model._param_encoder[0].in_features} -> "
           f"{model._param_encoder[2].out_features} MLP with Tanh), "
           f"then standard WaveNet weights.")
@@ -645,7 +826,40 @@ def main():
     tp.add_argument(
         "--resume",
         default=None,
-        help="Lightning .ckpt to resume from (fine-tuning; resets epoch counter)",
+        help="Lightning .ckpt to resume from (restores weights, optimizer, epoch, LR)",
+    )
+    tp.add_argument(
+        "--finetune",
+        default=None,
+        help="Lightning .ckpt to load weights from (resets epoch counter and optimizer)",
+    )
+    tp.add_argument(
+        "--delay",
+        type=int,
+        default=DELAY_SAMPLES,
+        help=f"Output delay in samples (default: {DELAY_SAMPLES})",
+    )
+    tp.add_argument(
+        "--train-stop-seconds",
+        type=float,
+        default=None,
+        help="Where to stop training data. Negative = relative to end (e.g. -9.0). "
+        f"Default: {TRAIN_SECONDS}s from start.",
+    )
+    tp.add_argument(
+        "--val-start-seconds",
+        type=float,
+        default=None,
+        help="Where validation data starts. Negative = relative to end (e.g. -9.0). "
+        "Default: immediately after training data.",
+    )
+    tp.add_argument(
+        "--model-size",
+        choices=list(_MODEL_PRESETS.keys()),
+        default=DEFAULT_MODEL_SIZE,
+        help=f"Model preset (default: {DEFAULT_MODEL_SIZE}). "
+        f"'small' ~26K params, 'large' ~101K params. Must match the preset "
+        f"used to train a checkpoint when --resume is used.",
     )
 
     ep = sub.add_parser("export", help="Export .pt model to .nam format")
@@ -654,6 +868,14 @@ def main():
         "--output",
         default="parametric_wavenet.nam",
         help="Output .nam file path (default: parametric_wavenet.nam)",
+    )
+    ep.add_argument(
+        "--sample-rate",
+        type=int,
+        default=None,
+        help="Sample rate to embed in .nam metadata. Required only for legacy "
+             ".pt files that don't store sample_rate (e.g. produced before this "
+             "field was added).",
     )
 
     ip = sub.add_parser("infer", help="Run inference with a trained model")
