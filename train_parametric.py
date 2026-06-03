@@ -400,8 +400,28 @@ def _detect_capture_pattern(data_dir):
             return "{cap_num} " + f.name[2:]
     raise FileNotFoundError(
         f"Cannot detect capture WAV pattern in {data_dir}. "
-        "Expected files like '1 ADA MP-1 NAM.wav'."
+        "Expected files like '1 ADA MP-1 NAM.wav'. If your captures number the "
+        "files differently (e.g. a trailing number), pass --capture-pattern."
     )
+
+
+def _resolve_capture_pattern(data_dir, override=None):
+    """Resolve the capture WAV filename template.
+
+    :param override: Explicit template from --capture-pattern. Used verbatim
+        when given; must contain the '{cap_num}' placeholder so each capture
+        number can be substituted (it may sit anywhere in the name, e.g. a
+        trailing index like 'MP-1 3TM NAM Amp DI {cap_num}.wav'). When None,
+        falls back to auto-detection.
+    """
+    if override is not None:
+        if "{cap_num}" not in override:
+            raise ValueError(
+                "--capture-pattern must contain the '{cap_num}' placeholder, "
+                "e.g. 'MP-1 3TM NAM Amp DI {cap_num}.wav'"
+            )
+        return override
+    return _detect_capture_pattern(data_dir)
 
 
 def _resample_tensor(x, from_rate, to_rate):
@@ -424,6 +444,7 @@ def load_data(
     delay_samples=DELAY_SAMPLES,
     train_stop_seconds=None,
     val_start_seconds=None,
+    capture_pattern=None,
 ):
     """Load all WAV files, apply delay correction, and create train/val datasets.
 
@@ -438,7 +459,7 @@ def load_data(
     data_dir = Path(data_dir)
     captures = param_config["captures"]
     param_specs = param_config["params"]
-    cap_pattern = _detect_capture_pattern(data_dir)
+    cap_pattern = _resolve_capture_pattern(data_dir, capture_pattern)
     print(f"Capture pattern: {cap_pattern}")
 
     # Detect sample rates
@@ -638,6 +659,7 @@ def do_train(args):
         delay_samples=args.delay,
         train_stop_seconds=args.train_stop_seconds,
         val_start_seconds=args.val_start_seconds,
+        capture_pattern=args.capture_pattern,
     )
     lit_model = ParametricLightningModule(model, lr=args.lr)
 
@@ -963,6 +985,14 @@ def main():
         help=f"Model preset (default: {DEFAULT_MODEL_SIZE}). "
         f"'small' ~26K params, 'large' ~101K params. Must match the preset "
         f"used to train a checkpoint when --resume is used.",
+    )
+    tp.add_argument(
+        "--capture-pattern",
+        default=None,
+        metavar="TEMPLATE",
+        help="Explicit capture WAV filename template with a '{cap_num}' "
+        "placeholder, e.g. 'MP-1 3TM NAM Amp DI {cap_num}.wav'. Overrides "
+        "auto-detection; use when the capture number isn't a leading prefix.",
     )
 
     ep = sub.add_parser("export", help="Export .pt model to .nam format")
