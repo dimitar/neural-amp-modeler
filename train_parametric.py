@@ -55,9 +55,11 @@ _MODEL_PRESETS = {
 }
 DEFAULT_MODEL_SIZE = "small"
 
-# (capture_number, OD1, OD2)
-# 5x5 grid: OD2 varies by group (2,4,6,8,10), OD1 varies within group.
-# Capture 6: RTF listed (4,4) in error; actual settings are OD1=2, OD2=4.
+# Legacy reference mapping for the ADA MP-1 Tube-Dist 5x5 grid.
+# The training pipeline now reads params.json from each dataset directory;
+# this constant is retained only for the parse_rtf.py validation utility.
+# (capture_number, OD1, OD2). Capture 6: RTF listed (4,4) in error;
+# actual settings are OD1=2, OD2=4.
 PARAM_TABLE = [
     (1, 2, 2),
     (2, 4, 2),
@@ -114,9 +116,48 @@ def _build_layer_configs(model_size):
     ]
 
 
-def normalize_params(od1, od2):
-    """Normalize knob values from [2, 10] to [0, 1]."""
-    return (od1 - 2) / 8, (od2 - 2) / 8
+def normalize_params(values, param_specs):
+    """Normalize knob values to [0, 1] using each param's [minimum, maximum].
+
+    :param values: Iterable of float knob values in source units.
+    :param param_specs: List of {"name", "minimum", "maximum"} dicts in the
+        same order as values.
+    :return: List of floats in [0, 1].
+    """
+    return [
+        (float(v) - p["minimum"]) / (p["maximum"] - p["minimum"])
+        for v, p in zip(values, param_specs)
+    ]
+
+
+def _load_params_config(data_dir):
+    """Read params.json from a dataset directory.
+
+    The file describes the knob schema (name + range per knob) and the
+    capture-to-knob-value mapping. Required for both training and the
+    .nam export's param_encoder metadata.
+    """
+    cfg_path = Path(data_dir) / "params.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(
+            f"Missing {cfg_path}. Each dataset directory must include a "
+            "params.json describing knob ranges and the capture mapping."
+        )
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    if "params" not in cfg or "captures" not in cfg:
+        raise ValueError(
+            f"{cfg_path} must define 'params' and 'captures' keys."
+        )
+    # Sanity: capture values must match number of params
+    n_params = len(cfg["params"])
+    for entry in cfg["captures"]:
+        if len(entry["values"]) != n_params:
+            raise ValueError(
+                f"{cfg_path}: capture {entry['capture']} has "
+                f"{len(entry['values'])} values, expected {n_params}."
+            )
+    return cfg
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
@@ -377,6 +418,7 @@ def _resample_tensor(x, from_rate, to_rate):
 
 def load_data(
     data_dir,
+    param_config,
     nx,
     ny_train=NY,
     delay_samples=DELAY_SAMPLES,
@@ -386,6 +428,7 @@ def load_data(
     """Load all WAV files, apply delay correction, and create train/val datasets.
 
     Args:
+        param_config: Loaded params.json dict (see _load_params_config).
         train_stop_seconds: Where to stop training data. Negative values are
             relative to end of file (e.g. -9.0 means stop 9s before end).
             None uses TRAIN_SECONDS from start.
@@ -393,12 +436,14 @@ def load_data(
             relative to end of file. None means immediately after training data.
     """
     data_dir = Path(data_dir)
+    captures = param_config["captures"]
+    param_specs = param_config["params"]
     cap_pattern = _detect_capture_pattern(data_dir)
     print(f"Capture pattern: {cap_pattern}")
 
     # Detect sample rates
     input_info = sf.info(str(data_dir / "input.wav"))
-    first_cap_path = data_dir / cap_pattern.format(cap_num=PARAM_TABLE[0][0])
+    first_cap_path = data_dir / cap_pattern.format(cap_num=captures[0]["capture"])
     capture_info = sf.info(str(first_cap_path))
     target_rate = capture_info.samplerate
     print(f"Input sample rate: {input_info.samplerate} Hz")
@@ -414,19 +459,20 @@ def load_data(
 
     ys = []
     params_list = []
-    for cap_num, od1, od2 in PARAM_TABLE:
-        wav_path = data_dir / cap_pattern.format(cap_num=cap_num)
+    for entry in captures:
+        wav_path = data_dir / cap_pattern.format(cap_num=entry["capture"])
         y = wav_to_tensor(wav_path)
         # Delay correction: output is behind input by delay_samples
         ys.append(y[delay_samples:])
-        params_list.append(normalize_params(od1, od2))
+        params_list.append(normalize_params(entry["values"], param_specs))
 
     if delay_samples > 0:
         x = x[:-delay_samples]
 
     for i, y in enumerate(ys):
         assert len(y) == len(x), (
-            f"Capture {PARAM_TABLE[i][0]}: length {len(y)} != input length {len(x)}"
+            f"Capture {captures[i]['capture']}: length {len(y)} "
+            f"!= input length {len(x)}"
         )
 
     total_samples = len(x)
@@ -550,6 +596,14 @@ class _MetricsLogger(pl.callbacks.Callback):
 
 def do_train(args):
     """Train the parametric WaveNet model."""
+    param_config = _load_params_config(args.data_dir)
+    n_params = len(param_config["params"])
+    n_captures = len(param_config["captures"])
+    print(
+        f"Loaded params.json: {n_params} knobs, {n_captures} captures "
+        f"({', '.join(p['name'] for p in param_config['params'])})"
+    )
+
     preset = _MODEL_PRESETS[args.model_size]
     layer_configs = _build_layer_configs(args.model_size)
     print(f"Model size: {args.model_size} "
@@ -559,6 +613,7 @@ def do_train(args):
     model = ParametricWaveNet(
         layer_configs=layer_configs,
         head_scale=HEAD_SCALE,
+        num_params=n_params,
         condition_size=preset["condition_size"],
     )
 
@@ -578,6 +633,7 @@ def do_train(args):
 
     train_loader, val_loader, target_rate = load_data(
         args.data_dir,
+        param_config,
         model.receptive_field,
         delay_samples=args.delay,
         train_stop_seconds=args.train_stop_seconds,
@@ -634,6 +690,7 @@ def do_train(args):
             "receptive_field": model.receptive_field,
             "model_size": args.model_size,
             "sample_rate": target_rate,
+            "param_config": param_config,
         },
         save_path,
     )
@@ -646,10 +703,14 @@ def do_train(args):
 def do_infer(args):
     """Run inference with a trained parametric WaveNet model."""
     ckpt = torch.load(args.checkpoint, weights_only=False)
+    param_config = ckpt.get("param_config") or _LEGACY_TUBE_DIST_CONFIG
+    param_specs = param_config["params"]
+
     model = ParametricWaveNet(
         layer_configs=ckpt["layer_configs"],
         head_config=ckpt["head_config"],
         head_scale=ckpt["head_scale"],
+        num_params=len(param_specs),
         condition_size=ckpt["condition_size"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
@@ -659,17 +720,37 @@ def do_infer(args):
     model = model.to(device)
 
     x = wav_to_tensor(args.input_wav).to(device)
-    od1_n, od2_n = normalize_params(args.od1, args.od2)
-    params = torch.tensor([[od1_n, od2_n]], dtype=torch.float32, device=device)
+    raw_values = [args.od1, args.od2]
+    for v, spec in zip(raw_values, param_specs):
+        if not (spec["minimum"] <= v <= spec["maximum"]):
+            raise SystemExit(
+                f"{spec['name']}={v} is outside the trained range "
+                f"[{spec['minimum']}, {spec['maximum']}]."
+            )
+    normalized = normalize_params(raw_values, param_specs)
+    params = torch.tensor([normalized], dtype=torch.float32, device=device)
+    sample_rate = ckpt.get("sample_rate", SAMPLE_RATE)
 
-    print(f"Input: {len(x)} samples ({len(x) / SAMPLE_RATE:.1f}s)")
-    print(f"OD1={args.od1} ({od1_n:.3f}), OD2={args.od2} ({od2_n:.3f})")
+    print(f"Input: {len(x)} samples ({len(x) / sample_rate:.1f}s @ {sample_rate} Hz)")
+    for raw, n, spec in zip(raw_values, normalized, param_specs):
+        print(f"{spec['name']}={raw} ({n:.3f}) range=[{spec['minimum']}, {spec['maximum']}]")
 
     with torch.no_grad():
         y = model(params, x.unsqueeze(0), pad_start=True).squeeze(0)
 
-    tensor_to_wav(y, args.output_wav, rate=SAMPLE_RATE)
+    tensor_to_wav(y, args.output_wav, rate=sample_rate)
     print(f"Output saved to {args.output_wav}")
+
+
+# Used as a fallback when loading legacy .pt checkpoints that pre-date
+# the param_config field. The original hardcoded mapping was Tube-Dist.
+_LEGACY_TUBE_DIST_CONFIG = {
+    "params": [
+        {"name": "OD1", "minimum": 2.0, "maximum": 10.0},
+        {"name": "OD2", "minimum": 2.0, "maximum": 10.0},
+    ],
+    "captures": [{"capture": c, "values": [o1, o2]} for c, o1, o2 in PARAM_TABLE],
+}
 
 
 # ─── Export to .nam ───────────────────────────────────────────────────────
@@ -695,12 +776,16 @@ def _export_wavenet_weights(model):
     return weights
 
 
-def export_nam(model, output_path, sample_rate):
+def export_nam(model, output_path, sample_rate, param_specs):
     """Export a trained ParametricWaveNet to .nam JSON format.
 
     Weight order: [param_encoder_weights..., wavenet_weights..., head_scale]
     The C++ loader should read param_encoder weights first (based on
     param_encoder config), then the standard WaveNet weights.
+
+    :param param_specs: List of {"name", "minimum", "maximum"} dicts in the
+        order matching the model's input parameters. Embedded into the .nam's
+        param_encoder.params so the plugin shows correct knob ranges.
     """
     model.eval()
     model.cpu()
@@ -708,14 +793,23 @@ def export_nam(model, output_path, sample_rate):
     # Param encoder config
     linear1 = model._param_encoder[0]
     linear2 = model._param_encoder[2]
+    if linear1.in_features != len(param_specs):
+        raise ValueError(
+            f"Model has {linear1.in_features} input params but param_specs "
+            f"has {len(param_specs)}. These must match."
+        )
     param_encoder_config = {
         "num_params": linear1.in_features,
         "hidden_size": linear1.out_features,
         "condition_size": linear2.out_features,
         "activation": "Tanh",
         "params": [
-            {"name": "OD1", "minimum": 2.0, "maximum": 10.0},
-            {"name": "OD2", "minimum": 2.0, "maximum": 10.0},
+            {
+                "name": p["name"],
+                "minimum": float(p["minimum"]),
+                "maximum": float(p["maximum"]),
+            }
+            for p in param_specs
         ],
     }
 
@@ -769,10 +863,13 @@ def export_nam(model, output_path, sample_rate):
 def do_export(args):
     """Export trained .pt model to .nam format."""
     ckpt = torch.load(args.checkpoint, weights_only=False)
+    param_config = ckpt.get("param_config") or _LEGACY_TUBE_DIST_CONFIG
+    param_specs = param_config["params"]
     model = ParametricWaveNet(
         layer_configs=ckpt["layer_configs"],
         head_config=ckpt["head_config"],
         head_scale=ckpt["head_scale"],
+        num_params=len(param_specs),
         condition_size=ckpt["condition_size"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
@@ -785,7 +882,13 @@ def do_export(args):
             )
         sample_rate = args.sample_rate
     print(f"Sample rate: {sample_rate} Hz")
-    export_nam(model, args.output, sample_rate)
+    print(
+        "Knobs: "
+        + ", ".join(
+            f"{p['name']}=[{p['minimum']}, {p['maximum']}]" for p in param_specs
+        )
+    )
+    export_nam(model, args.output, sample_rate, param_specs)
     print(f"\nTo load in C++, parse param_encoder weights first ({model._param_encoder[0].in_features} -> "
           f"{model._param_encoder[2].out_features} MLP with Tanh), "
           f"then standard WaveNet weights.")
@@ -883,10 +986,12 @@ def main():
     ip.add_argument("--input-wav", required=True, help="Input WAV file (DI signal)")
     ip.add_argument("--output-wav", required=True, help="Output WAV file path")
     ip.add_argument(
-        "--od1", type=float, required=True, help="OD1 knob value (2-10)"
+        "--od1", type=float, required=True,
+        help="OD1 knob value (must be within the trained range from the checkpoint)"
     )
     ip.add_argument(
-        "--od2", type=float, required=True, help="OD2 knob value (2-10)"
+        "--od2", type=float, required=True,
+        help="OD2 knob value (must be within the trained range from the checkpoint)"
     )
 
     args = parser.parse_args()

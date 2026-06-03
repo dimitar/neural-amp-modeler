@@ -147,4 +147,9 @@ tests/resources/*.reapeaks
 # Training outputs and data
 parametric_output/
 parametric_output_small_test/
+parametric_output_*/
+output/
 data/
+
+# Crash dumps
+*.stackdump
