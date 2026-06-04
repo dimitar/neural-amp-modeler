@@ -76,12 +76,13 @@ def build_app():
             knobs = gr.Dataframe(
                 headers=["name", "minimum", "maximum"],
                 datatype=["str", "number", "number"],
+                type="array",  # hand handlers list-of-lists, not a pandas frame
                 row_count=2,
                 label="Knobs (leave min/max blank to auto-derive)",
                 value=[["OD1", None, None], ["OD2", None, None]],
             )
             grid = gr.Dataframe(label="Capture → values (first column = capture #)",
-                                row_count=None)
+                                type="array", row_count=None)
             csv_file = gr.File(label="…or load a CSV")
             load_csv_btn = gr.Button("Load CSV into grid")
             gen_btn = gr.Button("Generate params.json", variant="primary")
@@ -94,20 +95,40 @@ def build_app():
 
             load_csv_btn.click(do_load_csv, [csv_file], [knobs, grid])
 
+            def _num_or_none(x):
+                if x is None:
+                    return None
+                s = str(x).strip()
+                if s == "" or s.lower() == "nan":
+                    return None
+                return float(s)
+
+            def _is_blank(x):
+                return x is None or str(x).strip() == "" or str(x).strip().lower() == "nan"
+
             def do_generate(folder, knob_tbl, grid_tbl):
                 if not folder:
                     return "Scan a folder first."
                 knob_specs = []
                 for r in knob_tbl:
-                    if not r or not str(r[0]).strip():
+                    if not r or _is_blank(r[0]):
                         continue
                     spec = {"name": str(r[0]).strip()}
-                    if r[1] is not None and r[2] is not None:
-                        spec["minimum"], spec["maximum"] = float(r[1]), float(r[2])
+                    try:
+                        mn, mx = _num_or_none(r[1]), _num_or_none(r[2])
+                    except ValueError:
+                        return f"⚠️ Knob '{spec['name']}' has a non-numeric min/max."
+                    if mn is not None and mx is not None:
+                        spec["minimum"], spec["maximum"] = mn, mx
                     knob_specs.append(spec)
+                if not knob_specs:
+                    return "Add at least one knob (name) first."
+                rows = [r for r in grid_tbl if r and not _is_blank(r[0])]
+                if not rows:
+                    return "The capture grid is empty — load a CSV or add rows."
                 try:
                     path, warns = pe.generate_params_json(
-                        folder, knob_specs, grid_tbl, force=True)
+                        folder, knob_specs, rows, force=True)
                 except Exception as e:  # noqa: BLE001
                     return f"⚠️ {e}"
                 msg = f"✓ Wrote `{path}`."
