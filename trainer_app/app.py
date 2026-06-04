@@ -128,13 +128,18 @@ def build_app():
             start_btn = gr.Button("Start training", variant="primary")
             stop_btn = gr.Button("Stop")
             log = gr.Textbox(label="Log", lines=20, max_lines=20, autoscroll=True)
+            stop_msg = gr.Markdown()
 
             def do_train(folder, pattern, out, ms, dl, ep, l_r, ts, vs, box):
-                proc = rn.TrainProcess(rn.build_train_command(
-                    folder, out, model_size=ms, delay=int(dl), epochs=int(ep),
-                    lr=float(l_r), train_stop_seconds=float(ts),
-                    val_start_seconds=float(vs), capture_pattern=pattern))
-                proc.start()
+                try:
+                    proc = rn.TrainProcess(rn.build_train_command(
+                        folder, out, model_size=ms, delay=int(dl), epochs=int(ep),
+                        lr=float(l_r), train_stop_seconds=float(ts),
+                        val_start_seconds=float(vs), capture_pattern=pattern))
+                    proc.start()
+                except Exception as e:  # noqa: BLE001
+                    yield f"⚠️ Could not start training: {e}", box
+                    return
                 box["proc"] = proc
                 buffer = ""
                 for line in proc.stream():
@@ -157,7 +162,7 @@ def build_app():
                     return "Stopping (saving model)…"
                 return "Nothing to stop."
 
-            stop_btn.click(do_stop, [proc_box], [input_msg])
+            stop_btn.click(do_stop, [proc_box], [stop_msg])
 
         # --- 4. Export ---
         with gr.Tab("4. Export"):
@@ -182,8 +187,11 @@ def build_app():
 
             def do_open(out):
                 p = Path(out).resolve()
-                if os.name == "nt":
-                    os.startfile(p)  # noqa: S606
+                try:
+                    if os.name == "nt":
+                        os.startfile(p)  # noqa: S606
+                except OSError as e:  # noqa: BLE001
+                    return f"⚠️ Could not open `{p}`: {e}"
                 return f"Opened `{p}`."
 
             open_btn.click(do_open, [out_dir], [export_msg])
