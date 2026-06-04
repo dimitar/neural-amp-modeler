@@ -9,12 +9,17 @@ from matplotlib.figure import Figure
 
 
 def progress_bar_md(epoch, total, eta_h, eta_m):
-    """Markdown string: 'Epoch E/total · ETA HhMMm' plus a unicode bar."""
-    frac = min(1.0, (epoch + 1) / total) if total else 0.0
+    """Markdown string: 'Epoch N/total · ETA HhMMm' plus a unicode bar.
+
+    `epoch` is the trainer's 0-indexed epoch; it is displayed 1-indexed so the
+    label and the bar percentage agree (Epoch 1/250 … Epoch 250/250 · 100%).
+    """
+    shown = epoch + 1
+    frac = min(1.0, shown / total) if total else 0.0
     filled = int(round(frac * 20))
     bar = "█" * filled + "░" * (20 - filled)
     return (
-        f"**Epoch {epoch}/{total}** · ETA {eta_h}h{eta_m:02d}m\n\n"
+        f"**Epoch {shown}/{total}** · ETA {eta_h}h{eta_m:02d}m\n\n"
         f"`{bar}` {frac * 100:.0f}%"
     )
 
