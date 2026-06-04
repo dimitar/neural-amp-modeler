@@ -190,10 +190,11 @@ def _build_layer_configs(model_size):
             **kernel_field,
             "dilations": dilations,
             "activation": activation,
+            # head_kernel_size > 1 backports upstream's aliasing-reduction
+            # head conv (see nam/models/wavenet/_layer_array.py). Default 1
+            # preserves back-compat for "small"/"large".
+            "head_kernel_size": p.get("head_kernel_size", 1),
             "film_params": _FILM_PARAMS,
-            # Metadata for export; not read by _LayerArray.init_from_config
-            # (HeadRechannel always uses kernel_size=1 internally).
-            "_head_kernel_size": p.get("head_kernel_size", 1),
         })
 
     return layer_configs
@@ -269,8 +270,6 @@ class ParametricWaveNet(nn.Module):
             nn.Linear(condition_size, condition_size),
             nn.Tanh(),
         )
-        # Store originals for export (includes _head_kernel_size metadata).
-        self._layer_configs = list(layer_configs)
         configs_with_position = []
         for i, lc in enumerate(layer_configs):
             c = {**lc, "is_first": i == 0, "is_last": i == len(layer_configs) - 1}
@@ -314,7 +313,15 @@ class ParametricWaveNet(nn.Module):
 
     @property
     def receptive_field(self):
-        return 1 + sum(la.receptive_field - 1 for la in self._layer_arrays)
+        # Inter-array signal is layer output x (not trimmed by head_rechannel);
+        # only the final array's head_rechannel kernel reduces final output.
+        if not self._layer_arrays:
+            return 1
+        intermediate = sum(
+            la._layers_receptive_field - 1 for la in self._layer_arrays[:-1]
+        )
+        last = self._layer_arrays[-1].receptive_field - 1
+        return 1 + intermediate + last
 
     def forward(self, params, x, pad_start=True):
         """
@@ -953,20 +960,9 @@ def export_nam(model, output_path, sample_rate):
     }
 
     # WaveNet config (reuses NAM's export_config which handles FiLM).
-    # Augment each exported layer config with a "head" dict that carries the
-    # head_kernel_size stored in _layer_configs (HeadRechannel's kernel is always 1
-    # internally; head_kernel_size > 1 is metadata for the C++ loader).
-    layers_config = []
-    for i, la in enumerate(model._layer_arrays):
-        exported = la.export_config()
-        orig = model._layer_configs[i] if i < len(model._layer_configs) else {}
-        head_ks = orig.get("_head_kernel_size", 1)
-        exported["head"] = {
-            "out_channels": exported["head_size"],
-            "kernel_size": head_ks,
-            "bias": exported.get("head_bias", True),
-        }
-        layers_config.append(exported)
+    # _LayerArray.export_config() now emits head_kernel_size natively (backported
+    # from upstream PR #653) — no augmentation needed.
+    layers_config = [la.export_config() for la in model._layer_arrays]
     head_config = None if model._head is None else model._head.export_config()
 
     # Flatten all weights: param_encoder first, then WaveNet

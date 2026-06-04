@@ -145,6 +145,47 @@ def test_a2_constants_match_upstream():
     raise AssertionError("upstream config missing channels_8 submodel")
 
 
+def test_head_kernel_size_is_actually_applied():
+    """Both new presets must construct a model with a kernel-16 head, not kernel-1.
+
+    Pinpoints the bug where head_kernel_size was metadata-only and the trained
+    model silently used kernel-1.
+    """
+    from train_parametric import (
+        _build_layer_configs,
+        ParametricWaveNet,
+        _MODEL_PRESETS,
+    )
+
+    for preset_name in ("small_k16head", "a2_small"):
+        preset = _MODEL_PRESETS[preset_name]
+        model = ParametricWaveNet(
+            _build_layer_configs(preset_name),
+            head_config=None,
+            head_scale=preset["head_scale"],
+            num_params=2,
+            condition_size=preset["condition_size"],
+        )
+        # The LAST layer array's head_rechannel is the model's effective output head.
+        last_la = model._layer_arrays[-1]
+        actual_kernel = last_la._head_rechannel.kernel_size[0]
+        assert actual_kernel == 16, (
+            f"{preset_name}: expected head_rechannel kernel 16 "
+            f"(aliasing fix), got {actual_kernel}"
+        )
+
+    # And verify "small" still uses kernel 1 (back-compat).
+    small_preset = _MODEL_PRESETS["small"]
+    small_model = ParametricWaveNet(
+        _build_layer_configs("small"),
+        head_config=None,
+        head_scale=small_preset["head_scale"],
+        num_params=2,
+        condition_size=small_preset["condition_size"],
+    )
+    assert small_model._layer_arrays[-1]._head_rechannel.kernel_size[0] == 1
+
+
 def test_a2_export_json_includes_new_fields(tmp_path):
     """Exported a2_small .nam JSON must include kernel_sizes (per-layer), head kernel_size
     16, and LeakyReLU activation."""
@@ -173,10 +214,9 @@ def test_a2_export_json_includes_new_fields(tmp_path):
     assert "kernel_sizes" in layer, "kernel_sizes not in exported layer config"
     assert layer["kernel_sizes"][:3] == [6, 6, 6], "unexpected kernel_sizes prefix"
 
-    # Head kernel size 16 in the augmented head dict
-    assert "head" in layer, "head dict not in exported layer config"
-    assert layer["head"]["kernel_size"] == 16, (
-        f"expected head kernel 16, got {layer['head']['kernel_size']}"
+    # Head kernel size 16 — native field emitted by _LayerArray.export_config()
+    assert layer.get("head_kernel_size") == 16, (
+        f"expected head_kernel_size 16, got {layer.get('head_kernel_size')!r}"
     )
 
     # LeakyReLU activation — export_config serializes each layer's activation
@@ -215,7 +255,6 @@ def test_small_k16head_export_json(tmp_path):
     layers = data["config"]["layers"]
     assert len(layers) == 2, f"expected 2 layer arrays, got {len(layers)}"
     for layer in layers:
-        assert "head" in layer, "head dict missing from exported layer"
-        assert layer["head"]["kernel_size"] == 16, (
-            f"expected head kernel 16, got {layer['head']['kernel_size']}"
+        assert layer.get("head_kernel_size") == 16, (
+            f"expected head_kernel_size 16, got {layer.get('head_kernel_size')!r}"
         )
