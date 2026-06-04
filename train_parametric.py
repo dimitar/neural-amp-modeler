@@ -261,12 +261,15 @@ class ParametricWaveNet(nn.Module):
 def _compute_per_capture_metrics(errors_by_capture, capture_table):
     """Aggregate per-sample errors by capture, OD1, OD2.
 
+    ESR is computed with pre-emphasis (PRE_EMPH_COEF=0.85), matching training
+    loss. Keys are suffixed with `_pe` to distinguish from plain val_ESR.
+
     Args:
         errors_by_capture: dict[capture_idx, list[float]] of ESR per sample
         capture_table: list of dicts with cap_num, od1, od2 (index = capture_idx)
 
     Returns:
-        dict with keys: per_capture, by_od1, by_od2, by_od1_od2, mean_esr
+        dict with keys: per_capture, by_od1, by_od2, by_od1_od2, mean_esr_pe
     """
     per_capture = {}
     by_od1 = {}
@@ -290,17 +293,17 @@ def _compute_per_capture_metrics(errors_by_capture, capture_table):
         per_capture[cap_num] = {
             "od1": meta["od1"],
             "od2": meta["od2"],
-            "esr_mean": mean_esr,
-            "esr_max": max_esr,
+            "esr_pe_mean": mean_esr,
+            "esr_pe_max": max_esr,
             "n_samples": len(samples),
         }
         by_od1.setdefault(od1, []).append(mean_esr)
         by_od2.setdefault(od2, []).append(mean_esr)
-        by_od1_od2[bucket] = mean_esr
+        by_od1_od2.setdefault(bucket, []).append(mean_esr)
 
     def _agg(d):
         return {
-            k: {"esr_mean": float(np.mean(v)), "esr_max": float(np.max(v)), "n": len(v)}
+            k: {"esr_pe_mean": float(np.mean(v)), "esr_pe_max": float(np.max(v)), "n": len(v)}
             for k, v in d.items()
         }
 
@@ -308,8 +311,8 @@ def _compute_per_capture_metrics(errors_by_capture, capture_table):
         "per_capture": per_capture,
         "by_od1": _agg(by_od1),
         "by_od2": _agg(by_od2),
-        "by_od1_od2": by_od1_od2,
-        "mean_esr": float(np.mean(capture_means)) if capture_means else 0.0,
+        "by_od1_od2": _agg(by_od1_od2),
+        "mean_esr_pe": float(np.mean(capture_means)) if capture_means else 0.0,
     }
 
 
@@ -374,12 +377,12 @@ class ParametricLightningModule(pl.LightningModule):
         self._last_val_metrics = metrics
 
         per_cap = list(metrics["per_capture"].items())
-        per_cap.sort(key=lambda kv: kv[1]["esr_mean"])
+        per_cap.sort(key=lambda kv: kv[1]["esr_pe_mean"])
         print(
             f"\n[epoch {self.current_epoch}] "
-            f"mean ESR {metrics['mean_esr']:.5f} | "
-            f"best 3: {[(k, round(v['esr_mean'], 5)) for k, v in per_cap[:3]]} | "
-            f"worst 3: {[(k, round(v['esr_mean'], 5)) for k, v in per_cap[-3:]]}"
+            f"mean ESR(pe) {metrics['mean_esr_pe']:.5f} | "
+            f"best 3: {[(k, round(v['esr_pe_mean'], 5)) for k, v in per_cap[:3]]} | "
+            f"worst 3: {[(k, round(v['esr_pe_mean'], 5)) for k, v in per_cap[-3:]]}"
         )
         self._val_errors_by_capture = {}
 
@@ -511,6 +514,13 @@ def load_data(
     params_list = []
     for cap_num, od1, od2 in PARAM_TABLE:
         wav_path = data_dir / cap_pattern.format(cap_num=cap_num)
+        cap_rate = sf.info(str(wav_path)).samplerate
+        if cap_rate != SAMPLE_RATE:
+            raise ValueError(
+                f"Capture {cap_num} sample rate {cap_rate} Hz != expected "
+                f"sample rate {SAMPLE_RATE} Hz ({wav_path.name}). "
+                f"Re-export captures at {SAMPLE_RATE} Hz."
+            )
         y = wav_to_tensor(wav_path)
         # Delay correction: output is behind input by delay_samples
         ys.append(y[delay_samples:])
@@ -655,8 +665,8 @@ def _write_per_capture_report(metrics, out_dir, architecture, epochs_trained):
     print(f"\nPer-capture ESR report → {json_path}")
 
     lines = [
-        "\n| cap | OD1 | OD2 | ESR mean |",
-        "|----:|----:|----:|---------:|",
+        "\n| cap | OD1 | OD2 | ESR(pe) mean |",
+        "|----:|----:|----:|-------------:|",
     ]
     rows = sorted(
         metrics["per_capture"].items(),
@@ -664,9 +674,11 @@ def _write_per_capture_report(metrics, out_dir, architecture, epochs_trained):
     )
     for cap_num, vals in rows:
         lines.append(
-            f"| {cap_num} | {vals['od1']} | {vals['od2']} | {vals['esr_mean']:.5f} |"
+            f"| {cap_num} | {vals['od1']} | {vals['od2']} | {vals['esr_pe_mean']:.5f} |"
         )
-    lines.append(f"\n**Mean ESR over {len(rows)} captures:** {metrics['mean_esr']:.5f}")
+    lines.append(
+        f"\n**Mean ESR(pe) over {len(rows)} captures:** {metrics['mean_esr_pe']:.5f}"
+    )
     print("\n".join(lines))
 
 
@@ -737,7 +749,7 @@ def do_train(args):
         print(f"Resuming from: {ckpt_path}")
     trainer.fit(lit_model, train_loader, val_loader, ckpt_path=ckpt_path)
 
-    if hasattr(lit_model, "_last_val_metrics") and lit_model._last_val_metrics is not None:
+    if lit_model._last_val_metrics is not None:
         _write_per_capture_report(
             lit_model._last_val_metrics,
             out_dir=out_dir,

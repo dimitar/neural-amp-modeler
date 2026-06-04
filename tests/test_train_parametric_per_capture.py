@@ -1,11 +1,8 @@
 """Tests for per-capture ESR logging in train_parametric."""
-import json
-import math
-
 import pytest
 import torch
 
-from train_parametric import ParametricDataset, PARAM_TABLE
+from train_parametric import ParametricDataset
 
 
 def test_paramdataset_returns_capture_id():
@@ -21,7 +18,7 @@ def test_paramdataset_returns_capture_id():
 
     sample = ds[0]
     assert len(sample) == 4, f"Expected 4-tuple (params, x, y, capture_id), got {len(sample)}-tuple"
-    params, x_seg, y_seg, capture_id = sample
+    _params, _x_seg, _y_seg, capture_id = sample
     assert isinstance(capture_id, int)
     assert 0 <= capture_id < n_captures
 
@@ -43,18 +40,23 @@ def test_compute_per_capture_metrics_groups_correctly():
 
     out = _compute_per_capture_metrics(errors_by_capture, capture_table)
 
-    assert out["per_capture"]["1"]["esr_mean"] == pytest.approx(0.0133, abs=1e-3)
-    assert out["per_capture"]["2"]["esr_mean"] == pytest.approx(0.045)
-    assert out["per_capture"]["3"]["esr_mean"] == pytest.approx(0.02)
+    assert out["per_capture"]["1"]["esr_pe_mean"] == pytest.approx(0.0133, abs=1e-3)
+    assert out["per_capture"]["2"]["esr_pe_mean"] == pytest.approx(0.045)
+    assert out["per_capture"]["3"]["esr_pe_mean"] == pytest.approx(0.02)
 
-    assert out["by_od1"]["2"]["esr_mean"] == pytest.approx(0.01667, abs=1e-3)
+    assert out["by_od1"]["2"]["esr_pe_mean"] == pytest.approx(0.01667, abs=1e-3)
     assert out["by_od1"]["2"]["n"] == 2
-    assert out["by_od1"]["4"]["esr_mean"] == pytest.approx(0.045)
+    assert out["by_od1"]["4"]["esr_pe_mean"] == pytest.approx(0.045)
 
-    assert out["by_od2"]["4"]["esr_mean"] == pytest.approx(0.02917, abs=1e-3)
+    assert out["by_od2"]["4"]["esr_pe_mean"] == pytest.approx(0.02917, abs=1e-3)
     assert out["by_od2"]["4"]["n"] == 2
 
-    assert out["mean_esr"] == pytest.approx((0.0133 + 0.045 + 0.02) / 3, abs=1e-3)
+    assert out["by_od1_od2"]["2_4"]["esr_pe_mean"] == pytest.approx(0.0133, abs=1e-3)
+    assert out["by_od1_od2"]["2_4"]["n"] == 1
+    assert out["by_od1_od2"]["4_4"]["esr_pe_mean"] == pytest.approx(0.045)
+    assert out["by_od1_od2"]["2_6"]["esr_pe_mean"] == pytest.approx(0.02)
+
+    assert out["mean_esr_pe"] == pytest.approx((0.0133 + 0.045 + 0.02) / 3, abs=1e-3)
 
 
 def test_load_data_rejects_mismatched_sample_rate(tmp_path):
@@ -69,6 +71,27 @@ def test_load_data_rejects_mismatched_sample_rate(tmp_path):
         np.zeros(44100),
         44100,
     )
+
+    with pytest.raises((AssertionError, ValueError), match=r"(?i)sample.?rate"):
+        load_data(tmp_path, nx=64)
+
+
+def test_load_data_rejects_mismatched_sample_rate_on_later_capture(tmp_path):
+    """load_data must validate ALL captures, not just the first one."""
+    import soundfile as sf
+    import numpy as np
+    from train_parametric import load_data, SAMPLE_RATE, PARAM_TABLE
+
+    pattern = "{cap_num} ADA MP-1 NAM.wav"
+    sf.write(str(tmp_path / "input.wav"), np.zeros(SAMPLE_RATE), SAMPLE_RATE)
+    # Write ALL captures at correct SR except index 1 (corrupt it)
+    for idx, (cap_num, _, _) in enumerate(PARAM_TABLE):
+        rate = 44100 if idx == 1 else SAMPLE_RATE
+        sf.write(
+            str(tmp_path / pattern.format(cap_num=cap_num)),
+            np.zeros(rate),
+            rate,
+        )
 
     with pytest.raises((AssertionError, ValueError), match=r"(?i)sample.?rate"):
         load_data(tmp_path, nx=64)
