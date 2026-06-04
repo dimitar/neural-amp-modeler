@@ -79,9 +79,13 @@ class TrainProcess:
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
+        # Force the child to flush stdout line-by-line. Without this, Python
+        # block-buffers stdout when it's a pipe, so progress (the log + the
+        # per-epoch progress bar) arrives in delayed bursts instead of live.
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
         self._proc = subprocess.Popen(
             self.cmd, cwd=self.cwd, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1, **kwargs,
+            stderr=subprocess.STDOUT, text=True, bufsize=1, env=env, **kwargs,
         )
 
     def stream(self):

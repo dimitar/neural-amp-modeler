@@ -172,7 +172,10 @@ def build_app():
                     yield f"⚠️ Could not start training: {e}", "", None, box
                     return
                 box["proc"] = proc
-                buffer, progress, records, cur, last_fig = "", "", [], None, None
+                buffer, records, cur, last_fig = "", [], None, None
+                progress = "⏳ Preparing data and starting training… (the first "
+                progress += "epoch can take a while at 96 kHz)"
+                yield buffer, progress, None, box
                 for line in proc.stream():
                     buffer += line + "\n"
                     ev = rn.parse_progress_line(line)
