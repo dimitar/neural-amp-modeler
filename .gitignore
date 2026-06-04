@@ -153,3 +153,6 @@ data/
 
 # Crash dumps
 *.stackdump
+
+# Trainer app runtime logs
+trainer_app/logs/
