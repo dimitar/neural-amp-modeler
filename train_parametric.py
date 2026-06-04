@@ -155,8 +155,10 @@ def _build_layer_configs(model_size):
       LeakyReLU), assembled into a dict that _LayerArray.init_from_config accepts.
     - Variable number of layer arrays: len(channels) arrays, not hardcoded to 2.
 
-    head_kernel_size is stored in the preset for export purposes but is NOT passed to
-    _LayerArray.init_from_config (HeadRechannel always uses kernel_size=1 internally).
+    head_kernel_size is threaded through as a real config field to
+    _LayerArray.parse_config, which uses it to construct HeadRechannel with the
+    given kernel width (backports upstream's aliasing-reduction head conv). Default
+    1 preserves back-compat for presets that don't set it.
     """
     p = _MODEL_PRESETS[model_size]
     channels = p["channels"]

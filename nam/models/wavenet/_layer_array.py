@@ -905,8 +905,14 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         :param c: (B,Dc,L) condition
 
         :return:
-            (B,Dc,L-R+1) head input
-            (B,Dc,L-R+1) layer output
+            (B,Dc,L-R+1)         head input  (post head_rechannel; final length)
+            (B,Dc,L-R+1+(k-1))   layer output (residual stream; k = head_rechannel
+                                 kernel size). Layers produce head_term at
+                                 out_length+(k-1) so that the kernel-k head conv
+                                 then yields exactly out_length samples; the
+                                 residual x is not trimmed by head_rechannel and
+                                 retains the extra (k-1) samples. When k=1 (the
+                                 default), the formula reduces to L-R+1 — back-compat.
         """
         out_length = min(x.shape[2], c.shape[2]) - (self.receptive_field - 1)
         # Layers produce head_term at pre_head_length; head_rechannel (kernel k)
