@@ -1012,6 +1012,45 @@ def export_nam(model, output_path, sample_rate):
 
 def do_export(args):
     """Export trained .pt model to .nam format."""
+    if args.random_init:
+        if not args.model_size:
+            raise SystemExit("--random-init requires --model-size")
+        preset = _MODEL_PRESETS[args.model_size]
+        layer_configs = _build_layer_configs(args.model_size)
+        model = ParametricWaveNet(
+            layer_configs=layer_configs,
+            head_config=None,
+            head_scale=preset["head_scale"],
+            num_params=2,
+            condition_size=preset["condition_size"],
+        )
+        # Override the identity-FiLM init with random scale/shift so the test
+        # fixture actually exercises the FiLM transforms (otherwise FiLM is a
+        # no-op and bit-equivalence wouldn't cover that code path).
+        with torch.no_grad():
+            for la in model._layer_arrays:
+                for layer in la._layers:
+                    for film in (
+                        layer._conv_pre_film,
+                        layer._conv_post_film,
+                        layer._input_mixin_pre_film,
+                        layer._input_mixin_post_film,
+                        layer._activation_pre_film,
+                        layer._activation_post_film,
+                        layer._layer1x1_post_film,
+                        layer._head1x1_post_film,
+                    ):
+                        if film is None:
+                            continue
+                        nn.init.normal_(film._film.weight, mean=0.0, std=0.05)
+                        nn.init.normal_(film._film.bias, mean=0.0, std=0.05)
+        sample_rate = args.sample_rate if args.sample_rate is not None else SAMPLE_RATE
+        print(f"Random-init {args.model_size} preset @ {sample_rate} Hz")
+        export_nam(model, args.output, sample_rate)
+        return
+
+    if not args.checkpoint:
+        raise SystemExit("--checkpoint is required when --random-init is not set")
     ckpt = torch.load(args.checkpoint, weights_only=False)
     model = ParametricWaveNet(
         layer_configs=ckpt["layer_configs"],
@@ -1107,7 +1146,7 @@ def main():
     )
 
     ep = sub.add_parser("export", help="Export .pt model to .nam format")
-    ep.add_argument("--checkpoint", required=True, help="Path to .pt model file")
+    ep.add_argument("--checkpoint", required=False, help="Path to .pt model file (omitted with --random-init)")
     ep.add_argument(
         "--output",
         default="parametric_wavenet.nam",
@@ -1120,6 +1159,18 @@ def main():
         help="Sample rate to embed in .nam metadata. Required only for legacy "
              ".pt files that don't store sample_rate (e.g. produced before this "
              "field was added).",
+    )
+    ep.add_argument(
+        "--random-init",
+        action="store_true",
+        help="Skip checkpoint loading; export a fresh-init model with random weights. "
+             "Used for generating C++ test fixtures.",
+    )
+    ep.add_argument(
+        "--model-size",
+        choices=list(_MODEL_PRESETS.keys()),
+        default=None,
+        help="Required with --random-init: which preset to instantiate.",
     )
 
     ip = sub.add_parser("infer", help="Run inference with a trained model")
