@@ -65,3 +65,15 @@ def test_place_input_wav_refuses_overwrite(tmp_path):
 
     ds.place_input_wav(tmp_path, src, force=True)
     assert dest.read_bytes() == b"DI"
+
+
+def test_scan_nonexistent_directory_reports_error(tmp_path):
+    missing = tmp_path / "nope"
+    status = ds.scan_dataset(missing)
+    assert status.ready is False
+    assert status.errors
+
+
+def test_place_input_wav_missing_source_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        ds.place_input_wav(tmp_path, tmp_path / "does-not-exist.wav")

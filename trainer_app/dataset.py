@@ -2,6 +2,8 @@
 # Purpose: Scan a capture folder, resolve the capture filename pattern, list
 #          captures, place input.wav, and report training readiness.
 
+from __future__ import annotations
+
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -11,7 +13,10 @@ from capture_naming import _resolve_capture_pattern
 
 
 def pattern_to_regex(pattern):
-    """Compile a '{cap_num}' template into a full-match regex with one int group."""
+    """Compile a '{cap_num}' template into a full-match regex with one int group.
+
+    Assumes the template contains exactly one '{cap_num}' placeholder.
+    """
     placeholder = "\x00"
     tmp = pattern.replace("{cap_num}", placeholder)
     escaped = re.escape(tmp).replace(placeholder, r"(\d+)")
@@ -28,10 +33,10 @@ def captures_from_pattern(names, pattern):
 @dataclass
 class DatasetStatus:
     data_dir: str
-    pattern: str = None
-    capture_numbers: list = field(default_factory=list)
+    pattern: str | None = None
+    capture_numbers: list[int] = field(default_factory=list)
     input_wav_present: bool = False
-    errors: list = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
     @property
     def ready(self):
@@ -67,8 +72,11 @@ def scan_dataset(data_dir, capture_pattern=None):
     return status
 
 
-def place_input_wav(data_dir, src_path, force=False):
-    """Copy a DI file into the dataset folder as input.wav, refusing overwrite."""
+def place_input_wav(data_dir, src_path, force=False) -> Path:
+    """Copy a DI file into the dataset folder as input.wav, refusing overwrite.
+
+    :returns: the destination Path (<data_dir>/input.wav).
+    """
     dest = Path(data_dir) / "input.wav"
     if dest.exists() and not force:
         raise FileExistsError(f"{dest} already exists. Use force=True to overwrite.")
