@@ -85,3 +85,20 @@ def test_train_process_streams_then_stops(tmp_path):
     proc.stop()
     proc.wait(timeout=10)
     assert proc.returncode is not None  # process actually exited
+
+
+def test_stop_before_start_is_safe():
+    proc = rn.TrainProcess(["py", "does-not-exist.py"])
+    proc.stop()          # must not raise
+    assert proc.returncode is None
+    assert proc.wait() is None
+
+
+def test_nonzero_exit_code_is_reported(tmp_path):
+    script = tmp_path / "boom.py"
+    script.write_text("import sys; sys.exit(3)")
+    proc = rn.TrainProcess([sys.executable, str(script)])
+    proc.start()
+    list(proc.stream())   # drain to completion
+    proc.wait(timeout=10)
+    assert proc.returncode == 3

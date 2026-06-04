@@ -45,7 +45,7 @@ def build_export_command(checkpoint, output, *, python_exe=None,
 
 
 _EPOCH_RE = re.compile(r"epoch\s+(\d+)/(\d+)\s+\((\d+)s, ETA (\d+)h(\d+)m\)")
-_METRIC_RE = re.compile(r"\|\s+(val_loss|val_ESR|train_ESR)\s*:\s*([\d.]+|-+)")
+_METRIC_RE = re.compile(r"\|\s+(val_loss|val_ESR|train_ESR)\s*:\s*([\d.]+|--+)")
 
 
 def parse_progress_line(line):
@@ -85,19 +85,31 @@ class TrainProcess:
         )
 
     def stream(self):
-        """Yield stdout lines (without trailing newline) until the process ends."""
+        """Yield stdout lines (without trailing newline) until the process ends.
+
+        Note: the caller is expected to consume the stream to completion. If the
+        caller breaks early, undrained stdout could (with a very verbose child)
+        fill the OS pipe buffer; the current trainer's output volume is far below
+        that limit.
+        """
+        if self._proc is None:
+            return
         for line in self._proc.stdout:
             yield line.rstrip("\n")
 
     def stop(self):
         """Send a graceful interrupt so train_parametric.py saves on shutdown."""
-        if self._proc and self._proc.poll() is None:
-            if os.name == "nt":
-                self._proc.send_signal(signal.CTRL_BREAK_EVENT)
-            else:
-                self._proc.send_signal(signal.SIGINT)
+        if not self._proc or self._proc.poll() is not None:
+            return
+        sig = signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT
+        try:
+            self._proc.send_signal(sig)
+        except OSError:
+            pass  # process exited between poll() and send_signal()
 
     def wait(self, timeout=None):
+        if self._proc is None:
+            return None
         return self._proc.wait(timeout=timeout)
 
     @property
