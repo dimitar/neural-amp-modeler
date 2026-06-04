@@ -50,10 +50,62 @@ LR_WARMUP_EPOCHS = 5  # Linear LR ramp-up over first N epochs
 # (~26K params, ~0.007 ESR on 24 captures). "large" (~101K params) gives
 # only marginal improvement and is ~3-4x slower at inference.
 _MODEL_PRESETS = {
-    "small": {"channels": (16, 8), "condition_size": 16, "head_size": (8, 1)},
-    "large": {"channels": (32, 16), "condition_size": 32, "head_size": (16, 1)},
+    "small": {
+        "channels": (16, 8),
+        "condition_size": 16,
+        "head_size": (8, 1),
+        # Explicit fields that _build_layer_configs was previously hardcoding:
+        "kernel_size": 3,
+        "head_kernel_size": 1,
+        "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+        "activation": "Tanh",
+        "head_scale": 0.02,
+    },
+    "large": {
+        "channels": (32, 16),
+        "condition_size": 32,
+        "head_size": (16, 1),
+        "kernel_size": 3,
+        "head_kernel_size": 1,
+        "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+        "activation": "Tanh",
+        "head_scale": 0.02,
+    },
+    # small_k16head: current architecture with head_kernel_size bumped from 1 to 16.
+    # Isolates A2's aliasing-reduction variable. Differs from "small" in
+    # head_kernel_size only.
+    "small_k16head": {
+        "channels": (16, 8),
+        "condition_size": 16,
+        "head_size": (8, 1),
+        "kernel_size": 3,
+        "head_kernel_size": 16,
+        "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+        "activation": "Tanh",
+        "head_scale": 0.02,
+    },
 }
 DEFAULT_MODEL_SIZE = "small"
+
+# A2 upstream constants pinned verbatim from
+# upstream NAM v0.13.0 nam/train/_resources/config_model_packed.json (channels_8 submodel).
+# Per-layer kernel_sizes: 14×6, 15, 15, 7×6. Dilations reset twice.
+_A2_KERNEL_SIZES = [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 15, 15, 6, 6, 6, 6, 6, 6, 6]
+_A2_DILATIONS   = [1, 3, 7, 17, 41, 101, 239, 1, 3, 7, 17, 41, 101, 239, 1, 13, 1, 3, 7, 17, 41, 101, 239]
+_A2_HEAD_KERNEL = 16
+
+# a2_small: full A2 bundle verbatim from upstream channels_8 submodel.
+_MODEL_PRESETS["a2_small"] = {
+    "channels": (8,),
+    "condition_size": 16,
+    "head_size": (1,),
+    "kernel_sizes": _A2_KERNEL_SIZES,   # per-layer; not a scalar
+    "head_kernel_size": _A2_HEAD_KERNEL,
+    "dilations": _A2_DILATIONS,
+    "activation": "LeakyReLU",
+    "activation_kwargs": {"negative_slope": 0.01},
+    "head_scale": 0.01,
+}
 
 # (capture_number, OD1, OD2)
 # 5x5 grid: OD2 varies by group (2,4,6,8,10), OD1 varies within group.

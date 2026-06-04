@@ -95,3 +95,25 @@ def test_load_data_rejects_mismatched_sample_rate_on_later_capture(tmp_path):
 
     with pytest.raises((AssertionError, ValueError), match=r"(?i)sample.?rate"):
         load_data(tmp_path, nx=64)
+
+
+def test_a2_constants_match_upstream():
+    """Detect silent drift if upstream changes the A2 config."""
+    import subprocess
+    import json
+    from train_parametric import _A2_KERNEL_SIZES, _A2_DILATIONS, _A2_HEAD_KERNEL
+
+    result = subprocess.run(
+        ["git", "show", "upstream/main:nam/train/_resources/config_model_packed.json"],
+        capture_output=True, text=True, check=True,
+        cwd="/Users/jmilo/src/guitar-plugin/neural-amp-modeler",
+    )
+    cfg = json.loads(result.stdout)
+    for sm in cfg["net"]["config"]["submodels"]:
+        if sm["name"] == "channels_8":
+            la = sm["config"]["layers_configs"][0]
+            assert la["kernel_sizes"] == _A2_KERNEL_SIZES, "upstream A2 kernel_sizes drifted"
+            assert la["dilations"] == _A2_DILATIONS, "upstream A2 dilations drifted"
+            assert la["head"]["kernel_size"] == _A2_HEAD_KERNEL, "upstream A2 head_kernel drifted"
+            return
+    raise AssertionError("upstream config missing channels_8 submodel")
