@@ -36,4 +36,6 @@ dependencies:
       - sounddevice
       - transformers>=4  # See requirements.txt
       - wavio >=0.0.5
+      - gradio       # trainer UI (trainer_app)
+      - pywebview    # trainer UI native window
       - -e ..

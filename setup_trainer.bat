@@ -51,15 +51,36 @@ echo ============================================================
 echo.
 
 call "%CONDA_ROOT%\Scripts\activate.bat"
-call conda env create -f environments\environment_gpu.yml
+
+REM Create the env if it isn't there yet (harmless "prefix already exists" if it is).
+if not exist "%CONDA_ROOT%\envs\nam\python.exe" (
+    call conda env create -f environments\environment_gpu.yml
+)
+
+if not exist "%CONDA_ROOT%\envs\nam\python.exe" (
+    echo.
+    echo Environment creation did NOT finish successfully. Review the messages above.
+    echo.
+    pause
+    exit /b 1
+)
+
+REM Ensure the trainer UI components are installed (also repairs an env that was
+REM created before these were added to environment_gpu.yml).
+echo.
+echo Ensuring trainer UI components (gradio, pywebview) are installed...
+call "%CONDA_ROOT%\Scripts\activate.bat" "%CONDA_ROOT%\envs\nam"
+call python -m pip install gradio pywebview
 
 echo.
-if exist "%CONDA_ROOT%\envs\nam\pythonw.exe" (
+if exist "%CONDA_ROOT%\envs\nam\Lib\site-packages\gradio" if exist "%CONDA_ROOT%\envs\nam\Lib\site-packages\webview" (
     echo Setup complete. The trainer can now be launched.
-) else (
-    echo Setup did NOT finish successfully. Review the messages above.
-    echo ^(If you saw "prefix already exists", the env may already be set up.^)
+    echo.
+    pause
+    exit /b 0
 )
+echo Setup finished, but the UI components may not have installed correctly.
+echo Review the messages above.
 echo.
 pause
 endlocal

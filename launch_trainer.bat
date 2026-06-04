@@ -39,10 +39,6 @@ if not defined CONDA_ROOT (
 
 set "NAM_ENV=%CONDA_ROOT%\envs\nam"
 
-REM ── Activate for this process only (sets up DLL/PATH). Exit code intentionally
-REM    ignored; success is verified by the env interpreter check below. ─────────
-call "%CONDA_ROOT%\Scripts\activate.bat" "%NAM_ENV%"
-
 if not exist "%NAM_ENV%\pythonw.exe" (
     echo.
     echo The 'nam' env at "%NAM_ENV%" looks incomplete ^(no pythonw.exe^).
@@ -52,6 +48,35 @@ if not exist "%NAM_ENV%\pythonw.exe" (
     exit /b 1
 )
 
+REM ── Ensure the trainer UI components are installed (gradio, pywebview). ──────
+REM    Missing UI deps were the cause of the window "closing silently": pythonw
+REM    crashed on `import gradio`/`import webview` with no console to show it.
+if not exist "%NAM_ENV%\Lib\site-packages\gradio" goto :setup
+if not exist "%NAM_ENV%\Lib\site-packages\webview" goto :setup
+goto :launch
+
+:setup
+echo.
+echo The trainer UI components aren't installed in the 'nam' env yet.
+echo Running one-time setup to install them ^(a setup window will open^)...
+echo.
+start "NAM Trainer setup" /wait "%~dp0setup_trainer.bat"
+if not exist "%NAM_ENV%\Lib\site-packages\gradio" goto :setupfail
+if not exist "%NAM_ENV%\Lib\site-packages\webview" goto :setupfail
+goto :launch
+
+:setupfail
+echo.
+echo Setup did not install the trainer UI components. Check the setup window output,
+echo or run:  conda activate nam  ^&^&  pip install gradio pywebview
+echo.
+pause
+exit /b 1
+
+:launch
+REM Activate for this process only (sets up DLL/PATH). Exit code intentionally
+REM ignored; success is verified by the checks above.
+call "%CONDA_ROOT%\Scripts\activate.bat" "%NAM_ENV%"
 cd /d "%~dp0"
 start "" "%NAM_ENV%\pythonw.exe" -m trainer_app.launch
 
