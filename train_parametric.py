@@ -318,12 +318,15 @@ def _compute_per_capture_metrics(errors_by_capture, capture_table):
 
 class ParametricLightningModule(pl.LightningModule):
     def __init__(self, model, lr=LR, lr_gamma=LR_GAMMA,
-                 warmup_epochs=LR_WARMUP_EPOCHS):
+                 warmup_epochs=LR_WARMUP_EPOCHS, capture_table=None):
         super().__init__()
         self._model = model
         self._lr = lr
         self._lr_gamma = lr_gamma
         self._warmup_epochs = warmup_epochs
+        self._capture_table = capture_table or []
+        self._val_errors_by_capture = {}
+        self._last_val_metrics = None
 
     def forward(self, params, x, **kwargs):
         return self._model(params, x, **kwargs)
@@ -349,7 +352,36 @@ class ParametricLightningModule(pl.LightningModule):
         self.log("val_loss", loss_mse, prog_bar=True)
         self.log("val_ESR", esr(preds, y_seg))
         self.log("val_MSE", loss_mse)
+
+        # Bin per-sample ESR by capture for per-epoch summary
+        for i in range(preds.shape[0]):
+            cid = int(capture_id[i])
+            sample_esr = float(esr(
+                apply_pre_emphasis_filter(preds[i:i+1], PRE_EMPH_COEF),
+                apply_pre_emphasis_filter(y_seg[i:i+1], PRE_EMPH_COEF),
+            ))
+            self._val_errors_by_capture.setdefault(cid, []).append(sample_esr)
+
         return loss_mse
+
+    def on_validation_epoch_end(self):
+        if not self._val_errors_by_capture or not self._capture_table:
+            self._val_errors_by_capture = {}
+            return
+        metrics = _compute_per_capture_metrics(
+            self._val_errors_by_capture, self._capture_table
+        )
+        self._last_val_metrics = metrics
+
+        per_cap = list(metrics["per_capture"].items())
+        per_cap.sort(key=lambda kv: kv[1]["esr_mean"])
+        print(
+            f"\n[epoch {self.current_epoch}] "
+            f"mean ESR {metrics['mean_esr']:.5f} | "
+            f"best 3: {[(k, round(v['esr_mean'], 5)) for k, v in per_cap[:3]]} | "
+            f"worst 3: {[(k, round(v['esr_mean'], 5)) for k, v in per_cap[-3:]]}"
+        )
+        self._val_errors_by_capture = {}
 
     def configure_optimizers(self):
         # Separate param groups: FiLM params get lower LR
@@ -641,7 +673,11 @@ def do_train(args):
         train_stop_seconds=args.train_stop_seconds,
         val_start_seconds=args.val_start_seconds,
     )
-    lit_model = ParametricLightningModule(model, lr=args.lr)
+    capture_table = [
+        {"cap_num": cap_num, "od1": od1, "od2": od2}
+        for cap_num, od1, od2 in PARAM_TABLE
+    ]
+    lit_model = ParametricLightningModule(model, lr=args.lr, capture_table=capture_table)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
