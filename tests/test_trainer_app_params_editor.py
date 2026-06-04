@@ -61,3 +61,11 @@ def test_generate_refuses_overwrite(tmp_path):
     (tmp_path / "params.json").write_text("existing")
     with pytest.raises(FileExistsError):
         pe.generate_params_json(tmp_path, [{"name": "OD1"}], [["1", "2"]])
+
+
+def test_generate_force_overwrites(tmp_path):
+    (tmp_path / "params.json").write_text("old")
+    knob_specs = [{"name": "OD1"}]
+    path, warnings = pe.generate_params_json(tmp_path, knob_specs, [["1", "2"]], force=True)
+    assert json.loads(path.read_text())["captures"] == [{"capture": 1, "values": [2]}]
+    assert warnings == []

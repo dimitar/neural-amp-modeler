@@ -7,7 +7,7 @@ import make_params_json as mpj
 
 
 def csv_to_grid(csv_path):
-    """Read a CSV into (knob_names, rows-of-string-cells incl. capture column)."""
+    """Return (knob_names, rows) where rows retain the leading capture cell."""
     header, rows = mpj.read_csv(csv_path)
     return header[1:], rows
 
@@ -18,6 +18,7 @@ def grid_to_config(knob_specs, rows):
     :param knob_specs: list of {"name", optional "minimum", "maximum"} dicts,
         in column order.
     :param rows: list of [capture, value1, value2, ...] cells (str or numeric).
+    Column count must match knob_specs; mismatches are raised by the delegate.
     """
     header = ["capture"] + [k["name"] for k in knob_specs]
     overrides = {
@@ -34,5 +35,8 @@ def generate_params_json(data_dir, knob_specs, rows, force=False):
     config = grid_to_config(knob_specs, rows)
     warnings = mpj.find_duplicate_value_groups(config)
     path = Path(data_dir) / "params.json"
-    mpj.write_params_json(config, path, force=force)
+    try:
+        mpj.write_params_json(config, path, force=force)
+    except FileExistsError:
+        raise FileExistsError(f"{path} already exists. Enable overwrite to replace it.")
     return path, warnings
