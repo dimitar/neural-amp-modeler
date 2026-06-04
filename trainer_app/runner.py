@@ -35,21 +35,36 @@ def build_train_command(
 
 
 def build_export_command(checkpoint, output, *, python_exe=None,
-                         script="train_parametric.py"):
-    """Return the argv for a `train_parametric.py export` invocation."""
-    return [
+                         sample_rate=None, script="train_parametric.py"):
+    """Return the argv for a `train_parametric.py export` invocation.
+
+    sample_rate is passed through as --sample-rate (used only as a fallback for
+    legacy .pt files that don't embed it; an embedded rate takes precedence).
+    """
+    cmd = [
         python_exe or sys.executable, script, "export",
         "--checkpoint", str(checkpoint),
         "--output", str(output),
     ]
+    if sample_rate:
+        cmd += ["--sample-rate", str(int(sample_rate))]
+    return cmd
 
 
 _EPOCH_RE = re.compile(r"epoch\s+(\d+)/(\d+)\s+\((\d+)s, ETA (\d+)h(\d+)m\)")
 _METRIC_RE = re.compile(r"\|\s+(val_loss|val_ESR|train_ESR)\s*:\s*([\d.]+|--+)")
+_STEP_RE = re.compile(r"~step (\d+)/(\d+) epoch (\d+)/(\d+)")
 
 
 def parse_progress_line(line):
     """Parse one stdout line into a progress dict, or None if not progress."""
+    m = _STEP_RE.search(line)
+    if m:
+        return {
+            "type": "step", "step": int(m.group(1)),
+            "total_steps": int(m.group(2)), "epoch": int(m.group(3)),
+            "max_epochs": int(m.group(4)),
+        }
     m = _EPOCH_RE.search(line)
     if m:
         return {

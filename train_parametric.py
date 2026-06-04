@@ -530,6 +530,20 @@ class _MetricsLogger(pl.callbacks.Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         self._epoch_start = time.time()
 
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Emit a throttled per-step line (~20 per epoch) so a UI can show a
+        # within-epoch progress bar that visibly advances during long epochs.
+        total = trainer.num_training_batches
+        if not total or total == float("inf"):
+            return
+        total = int(total)
+        if batch_idx % max(1, total // 20) == 0 or batch_idx == total - 1:
+            print(
+                f"~step {batch_idx + 1}/{total} "
+                f"epoch {trainer.current_epoch}/{trainer.max_epochs}",
+                flush=True,
+            )
+
     def on_validation_epoch_end(self, trainer, pl_module):
         m = trainer.callback_metrics
         epoch = trainer.current_epoch

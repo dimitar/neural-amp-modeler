@@ -8,19 +8,28 @@ matplotlib.use("Agg")  # headless, thread-safe (server context)
 from matplotlib.figure import Figure
 
 
-def progress_bar_md(epoch, total, eta_h, eta_m):
-    """Markdown string: 'Epoch N/total · ETA HhMMm' plus a unicode bar.
+def progress_bar_md(epoch, total, eta_h=None, eta_m=None, step=None, total_steps=None):
+    """Markdown training progress.
 
-    `epoch` is the trainer's 0-indexed epoch; it is displayed 1-indexed so the
-    label and the bar percentage agree (Epoch 1/250 … Epoch 250/250 · 100%).
+    The label shows the overall epoch position (1-indexed) and ETA. The bar fills
+    over the CURRENT epoch (via step/total_steps) so it visibly advances during a
+    long epoch instead of only jumping once per epoch. Without step info (an
+    epoch-boundary update) the bar shows the epoch as complete.
     """
     shown = epoch + 1
-    frac = min(1.0, shown / total) if total else 0.0
+    overall = min(1.0, shown / total) if total else 0.0
+    if step is not None and total_steps:
+        frac = min(1.0, step / total_steps)
+        tail = f"  (step {step}/{total_steps})"
+    else:
+        frac = 1.0
+        tail = ""
     filled = int(round(frac * 20))
     bar = "█" * filled + "░" * (20 - filled)
+    eta = f" · ETA {eta_h}h{eta_m:02d}m" if eta_h is not None and eta_m is not None else ""
     return (
-        f"**Epoch {shown}/{total}** · ETA {eta_h}h{eta_m:02d}m\n\n"
-        f"`{bar}` {frac * 100:.0f}%"
+        f"**Epoch {shown}/{total}** ({overall * 100:.0f}% overall){eta}\n\n"
+        f"`{bar}` {frac * 100:.0f}% of epoch{tail}"
     )
 
 

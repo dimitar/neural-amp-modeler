@@ -175,6 +175,7 @@ def build_app():
                 box["proc"] = proc
                 log_lines = deque(maxlen=400)  # bound the streamed log payload
                 records, cur, last_fig = [], None, None
+                eta_h, eta_m = None, None
                 progress = ("⏳ Preparing data and starting training… "
                             "(the first epoch can take a while at 96 kHz)")
                 yield "", progress, None, box
@@ -182,11 +183,16 @@ def build_app():
                     log_lines.append(line)
                     ev = rn.parse_progress_line(line)
                     plot_out = gr.update()
-                    if ev and ev["type"] == "epoch":
+                    if ev and ev["type"] == "step":
+                        progress = progress_bar_md(
+                            ev["epoch"], ev["max_epochs"], eta_h, eta_m,
+                            step=ev["step"], total_steps=ev["total_steps"])
+                    elif ev and ev["type"] == "epoch":
+                        eta_h, eta_m = ev["eta_h"], ev["eta_m"]
                         cur = {"epoch": ev["epoch"], "val_loss": None, "val_ESR": None}
                         records.append(cur)
                         progress = progress_bar_md(
-                            ev["epoch"], ev["max_epochs"], ev["eta_h"], ev["eta_m"])
+                            ev["epoch"], ev["max_epochs"], eta_h, eta_m)
                     elif (ev and ev["type"] == "metric" and ev["value"] is not None
                           and cur is not None and ev["name"] in ("val_loss", "val_ESR")):
                         cur[ev["name"]] = ev["value"]
@@ -220,24 +226,28 @@ def build_app():
                 nam_browse = gr.Button("💾 Save as…", scale=1)
             nam_browse.click(lambda: nd.pick_save_file("model.nam") or gr.update(),
                              None, nam_name)
+            sample_rate = gr.Number(
+                96000, label="Sample rate (Hz)",
+                info="Used only if the trained model file doesn't already store it.")
             export_btn = gr.Button("Export .nam", variant="primary")
             open_btn = gr.Button("Open output folder")
             export_msg = gr.Markdown()
 
-            def do_export(out, name):
+            def do_export(out, name, sr):
                 ckpt = Path(out) / "parametric_wavenet_model.pt"
                 if not ckpt.exists():
                     return f"⚠️ No trained model at `{ckpt}`. Train first."
                 name_path = Path(name)
                 nam_path = name_path if name_path.is_absolute() else Path(out) / name
-                cmd = rn.build_export_command(ckpt, nam_path)
+                cmd = rn.build_export_command(
+                    ckpt, nam_path, sample_rate=int(sr) if sr else None)
                 r = subprocess.run(cmd, cwd=str(rn.REPO_ROOT),
                                    capture_output=True, text=True)
                 if r.returncode != 0:
                     return f"⚠️ Export failed:\n```\n{r.stdout}\n{r.stderr}\n```"
                 return f"✓ Exported `{nam_path}`."
 
-            export_btn.click(do_export, [out_dir, nam_name], [export_msg])
+            export_btn.click(do_export, [out_dir, nam_name, sample_rate], [export_msg])
 
             def do_open(out):
                 p = Path(out).resolve()
