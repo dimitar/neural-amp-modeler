@@ -10,6 +10,7 @@ from pathlib import Path
 import gradio as gr
 
 from trainer_app import dataset as ds
+from trainer_app import native_dialogs as nd
 from trainer_app import params_editor as pe
 from trainer_app import runner as rn
 from trainer_app.progress_view import loss_figure, progress_bar_md
@@ -35,7 +36,10 @@ def build_app():
 
         # --- 1. Dataset ---
         with gr.Tab("1. Dataset"):
-            folder = gr.Textbox(label="Capture folder")
+            with gr.Row():
+                folder = gr.Textbox(label="Capture folder", scale=4)
+                folder_browse = gr.Button("📁 Browse…", scale=1)
+            folder_browse.click(lambda: nd.pick_folder() or gr.update(), None, folder)
             pattern_override = gr.Textbox(
                 label="Capture filename pattern (only if auto-detect fails)",
                 placeholder="e.g. MP-1 3TM NAM Amp DI {cap_num}.wav",
@@ -125,7 +129,10 @@ def build_app():
                                        label="Train stop seconds")
                 val_start = gr.Number(DEFAULTS["val_start_seconds"],
                                       label="Val start seconds")
-            out_dir = gr.Textbox("parametric_output", label="Output folder")
+            with gr.Row():
+                out_dir = gr.Textbox("parametric_output", label="Output folder", scale=4)
+                out_browse = gr.Button("📁 Browse…", scale=1)
+            out_browse.click(lambda: nd.pick_folder() or gr.update(), None, out_dir)
             start_btn = gr.Button("Start training", variant="primary")
             stop_btn = gr.Button("Stop")
             log = gr.Textbox(label="Log", lines=20, max_lines=20, autoscroll=True)
@@ -181,7 +188,11 @@ def build_app():
 
         # --- 4. Export ---
         with gr.Tab("4. Export"):
-            nam_name = gr.Textbox("model.nam", label="Output .nam filename")
+            with gr.Row():
+                nam_name = gr.Textbox("model.nam", label="Output .nam path", scale=4)
+                nam_browse = gr.Button("💾 Save as…", scale=1)
+            nam_browse.click(lambda: nd.pick_save_file("model.nam") or gr.update(),
+                             None, nam_name)
             export_btn = gr.Button("Export .nam", variant="primary")
             open_btn = gr.Button("Open output folder")
             export_msg = gr.Markdown()
@@ -190,7 +201,8 @@ def build_app():
                 ckpt = Path(out) / "parametric_wavenet_model.pt"
                 if not ckpt.exists():
                     return f"⚠️ No trained model at `{ckpt}`. Train first."
-                nam_path = Path(out) / name
+                name_path = Path(name)
+                nam_path = name_path if name_path.is_absolute() else Path(out) / name
                 cmd = rn.build_export_command(ckpt, nam_path)
                 r = subprocess.run(cmd, cwd=str(rn.REPO_ROOT),
                                    capture_output=True, text=True)
