@@ -32,15 +32,18 @@ def test_scan_prefix_dataset_ready(tmp_path):
     assert status.ready is True
 
 
-def test_scan_suffix_needs_override(tmp_path):
+def test_scan_suffix_autodetected(tmp_path):
+    # Trailing-number filenames are now auto-detected (no override needed).
     (tmp_path / "input.wav").write_bytes(b"")
     for n in (1, 2):
         (tmp_path / f"MP-1 3TM NAM Amp DI {n}.wav").write_bytes(b"")
 
     auto = ds.scan_dataset(tmp_path)
-    assert auto.ready is False           # auto-detect can't handle suffix
-    assert auto.errors
+    assert auto.pattern == "MP-1 3TM NAM Amp DI {cap_num}.wav"
+    assert auto.capture_numbers == [1, 2]
+    assert auto.ready is True
 
+    # An explicit override is still honoured.
     override = ds.scan_dataset(tmp_path, capture_pattern="MP-1 3TM NAM Amp DI {cap_num}.wav")
     assert override.capture_numbers == [1, 2]
     assert override.ready is True
