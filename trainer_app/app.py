@@ -12,6 +12,7 @@ import gradio as gr
 from trainer_app import dataset as ds
 from trainer_app import params_editor as pe
 from trainer_app import runner as rn
+from trainer_app.progress_view import loss_figure, progress_bar_md
 
 DEFAULTS = dict(model_size="small", delay=10, epochs=250, lr=4e-3,
                 train_stop_seconds=-9.0, val_start_seconds=-9.0)
@@ -129,6 +130,8 @@ def build_app():
             stop_btn = gr.Button("Stop")
             log = gr.Textbox(label="Log", lines=20, max_lines=20, autoscroll=True)
             stop_msg = gr.Markdown()
+            progress_md = gr.Markdown()
+            metrics_plot = gr.Plot(label="Loss / ESR (log scale)")
 
             def do_train(folder, pattern, out, ms, dl, ep, l_r, ts, vs, box):
                 try:
@@ -138,22 +141,34 @@ def build_app():
                         val_start_seconds=float(vs), capture_pattern=pattern))
                     proc.start()
                 except Exception as e:  # noqa: BLE001
-                    yield f"⚠️ Could not start training: {e}", box
+                    yield f"⚠️ Could not start training: {e}", "", None, box
                     return
                 box["proc"] = proc
-                buffer = ""
+                buffer, progress, records, cur, last_fig = "", "", [], None, None
                 for line in proc.stream():
                     buffer += line + "\n"
-                    yield buffer, box
+                    ev = rn.parse_progress_line(line)
+                    plot_out = gr.update()
+                    if ev and ev["type"] == "epoch":
+                        cur = {"epoch": ev["epoch"], "val_loss": None, "val_ESR": None}
+                        records.append(cur)
+                        progress = progress_bar_md(
+                            ev["epoch"], ev["max_epochs"], ev["eta_h"], ev["eta_m"])
+                    elif (ev and ev["type"] == "metric" and ev["value"] is not None
+                          and cur is not None and ev["name"] in ("val_loss", "val_ESR")):
+                        cur[ev["name"]] = ev["value"]
+                        last_fig = loss_figure(records)
+                        plot_out = last_fig
+                    yield buffer, progress, plot_out, box
                 proc.wait()
                 buffer += f"\n[exited with code {proc.returncode}]\n"
-                yield buffer, box
+                yield buffer, progress, (last_fig if last_fig is not None else gr.update()), box
 
             start_btn.click(
                 do_train,
                 [folder, state_pattern, out_dir, model_size, delay, epochs, lr,
                  train_stop, val_start, proc_box],
-                [log, proc_box])
+                [log, progress_md, metrics_plot, proc_box])
 
             def do_stop(box):
                 proc = box.get("proc")
