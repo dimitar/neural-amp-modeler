@@ -93,7 +93,9 @@ are imported **directly** (no subprocess) for config generation.
 4. **Export**
    - **Export .nam** (output name + folder) via the `export` subcommand.
    - **Open output folder**.
-   - **Test in Amp** — stubbed; will launch the Project-B test-bed later.
+
+   (Launching the exported model in the Project-B test-bed will be added when
+   that project is built — no stub now.)
 
 ## Launch / packaging
 
