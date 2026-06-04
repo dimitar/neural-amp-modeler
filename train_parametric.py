@@ -255,6 +255,64 @@ class ParametricWaveNet(nn.Module):
         return head_input.squeeze(1)  # (B, L')
 
 
+# ─── Per-capture metrics ──────────────────────────────────────────────────────
+
+
+def _compute_per_capture_metrics(errors_by_capture, capture_table):
+    """Aggregate per-sample errors by capture, OD1, OD2.
+
+    Args:
+        errors_by_capture: dict[capture_idx, list[float]] of ESR per sample
+        capture_table: list of dicts with cap_num, od1, od2 (index = capture_idx)
+
+    Returns:
+        dict with keys: per_capture, by_od1, by_od2, by_od1_od2, mean_esr
+    """
+    per_capture = {}
+    by_od1 = {}
+    by_od2 = {}
+    by_od1_od2 = {}
+
+    capture_means = []
+    for cap_idx, samples in errors_by_capture.items():
+        if not samples:
+            continue
+        meta = capture_table[cap_idx]
+        cap_num = str(meta["cap_num"])
+        od1 = str(meta["od1"])
+        od2 = str(meta["od2"])
+        bucket = f"{od1}_{od2}"
+
+        mean_esr = float(np.mean(samples))
+        max_esr = float(np.max(samples))
+        capture_means.append(mean_esr)
+
+        per_capture[cap_num] = {
+            "od1": meta["od1"],
+            "od2": meta["od2"],
+            "esr_mean": mean_esr,
+            "esr_max": max_esr,
+            "n_samples": len(samples),
+        }
+        by_od1.setdefault(od1, []).append(mean_esr)
+        by_od2.setdefault(od2, []).append(mean_esr)
+        by_od1_od2[bucket] = mean_esr
+
+    def _agg(d):
+        return {
+            k: {"esr_mean": float(np.mean(v)), "esr_max": float(np.max(v)), "n": len(v)}
+            for k, v in d.items()
+        }
+
+    return {
+        "per_capture": per_capture,
+        "by_od1": _agg(by_od1),
+        "by_od2": _agg(by_od2),
+        "by_od1_od2": by_od1_od2,
+        "mean_esr": float(np.mean(capture_means)) if capture_means else 0.0,
+    }
+
+
 # ─── Lightning Module ─────────────────────────────────────────────────────────
 
 
