@@ -123,7 +123,7 @@ def normalize_params(od1, od2):
 
 
 class ParametricDataset(Dataset):
-    """Dataset returning (params, x_segment, y_segment) tuples across all captures."""
+    """Dataset returning (params, x_segment, y_segment, capture_id) tuples across all captures."""
 
     def __init__(self, x, ys, params_list, nx, ny, start=None, stop=None):
         """
@@ -155,7 +155,7 @@ class ParametricDataset(Dataset):
         i = chunk_idx * self._ny
         x_seg = self._x[i : i + self._nx + self._ny - 1]
         y_seg = self._ys[capture_idx][i + self._nx - 1 : i + self._nx - 1 + self._ny]
-        return self._params_list[capture_idx], x_seg, y_seg
+        return self._params_list[capture_idx], x_seg, y_seg, capture_idx
 
 
 # ─── Model ────────────────────────────────────────────────────────────────────
@@ -271,7 +271,7 @@ class ParametricLightningModule(pl.LightningModule):
         return self._model(params, x, **kwargs)
 
     def training_step(self, batch, batch_idx):
-        params, x_seg, y_seg = batch
+        params, x_seg, y_seg, _ = batch
         preds = self._model(params, x_seg, pad_start=False)
         loss_mse = F.mse_loss(preds, y_seg)
         # Pre-emphasis MSE: amplifies high-frequency detail
@@ -285,7 +285,7 @@ class ParametricLightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        params, x_seg, y_seg = batch
+        params, x_seg, y_seg, capture_id = batch
         preds = self._model(params, x_seg, pad_start=False)
         loss_mse = F.mse_loss(preds, y_seg)
         self.log("val_loss", loss_mse, prog_bar=True)
