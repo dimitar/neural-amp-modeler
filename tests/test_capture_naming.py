@@ -21,3 +21,13 @@ def test_resolve_rejects_override_without_placeholder():
 def test_detect_prefix_pattern_on_disk(tmp_path):
     (tmp_path / "1 ADA MP-1 NAM.wav").write_bytes(b"")
     assert cn._detect_capture_pattern(tmp_path) == "{cap_num} ADA MP-1 NAM.wav"
+
+
+def test_detect_glob_fallback_for_arbitrary_name(tmp_path):
+    (tmp_path / "1 My Amp Capture.wav").write_bytes(b"")
+    assert cn._detect_capture_pattern(tmp_path) == "{cap_num} My Amp Capture.wav"
+
+
+def test_detect_raises_when_no_capture_wav(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        cn._detect_capture_pattern(tmp_path)
