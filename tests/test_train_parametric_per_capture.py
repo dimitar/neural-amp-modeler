@@ -1,4 +1,5 @@
 """Tests for per-capture ESR logging in train_parametric."""
+import json
 import pytest
 import torch
 
@@ -142,3 +143,79 @@ def test_a2_constants_match_upstream():
             assert la["head"]["kernel_size"] == _A2_HEAD_KERNEL, "upstream A2 head_kernel drifted"
             return
     raise AssertionError("upstream config missing channels_8 submodel")
+
+
+def test_a2_export_json_includes_new_fields(tmp_path):
+    """Exported a2_small .nam JSON must include kernel_sizes (per-layer), head kernel_size
+    16, and LeakyReLU activation."""
+    from train_parametric import (
+        _build_layer_configs,
+        ParametricWaveNet,
+        _MODEL_PRESETS,
+        export_nam,
+    )
+
+    preset = _MODEL_PRESETS["a2_small"]
+    model = ParametricWaveNet(
+        _build_layer_configs("a2_small"),
+        head_config=None,
+        head_scale=preset["head_scale"],
+        num_params=2,
+        condition_size=preset["condition_size"],
+    )
+    out = tmp_path / "a2.nam"
+    export_nam(model, str(out), sample_rate=48000)
+    data = json.loads(out.read_text())
+    # Export uses "layers" key (not "layers_configs")
+    layer = data["config"]["layers"][0]
+
+    # Per-layer kernel_sizes present and correct
+    assert "kernel_sizes" in layer, "kernel_sizes not in exported layer config"
+    assert layer["kernel_sizes"][:3] == [6, 6, 6], "unexpected kernel_sizes prefix"
+
+    # Head kernel size 16 in the augmented head dict
+    assert "head" in layer, "head dict not in exported layer config"
+    assert layer["head"]["kernel_size"] == 16, (
+        f"expected head kernel 16, got {layer['head']['kernel_size']}"
+    )
+
+    # LeakyReLU activation — export_config serializes each layer's activation
+    # as a list of per-layer dicts with "type" key; check the first entry.
+    activation = layer["activation"]
+    first = activation[0] if isinstance(activation, list) else activation
+    if isinstance(first, str):
+        act_type = first
+    else:
+        act_type = first.get("type")
+    assert act_type == "LeakyReLU", f"expected LeakyReLU, got {act_type!r}"
+
+
+def test_small_k16head_export_json(tmp_path):
+    """small_k16head must export with kernel_size 3 (per-layer or scalar)
+    and head kernel 16 on all layer arrays."""
+    from train_parametric import (
+        _build_layer_configs,
+        ParametricWaveNet,
+        _MODEL_PRESETS,
+        export_nam,
+    )
+
+    preset = _MODEL_PRESETS["small_k16head"]
+    model = ParametricWaveNet(
+        _build_layer_configs("small_k16head"),
+        head_config=None,
+        head_scale=preset["head_scale"],
+        num_params=2,
+        condition_size=preset["condition_size"],
+    )
+    out = tmp_path / "k16head.nam"
+    export_nam(model, str(out), sample_rate=48000)
+    data = json.loads(out.read_text())
+    # Export uses "layers" key
+    layers = data["config"]["layers"]
+    assert len(layers) == 2, f"expected 2 layer arrays, got {len(layers)}"
+    for layer in layers:
+        assert "head" in layer, "head dict missing from exported layer"
+        assert layer["head"]["kernel_size"] == 16, (
+            f"expected head kernel 16, got {layer['head']['kernel_size']}"
+        )
