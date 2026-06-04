@@ -19,6 +19,7 @@ def main():
         from trainer_app.app import build_app
 
         app = build_app()
+        app.queue()  # enable live streaming of generator outputs (training log/progress)
         _, local_url, _ = app.launch(
             prevent_thread_lock=True, server_port=7860,
             inbrowser=False, show_error=True,

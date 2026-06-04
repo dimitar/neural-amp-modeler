@@ -640,6 +640,10 @@ def do_train(args):
         default_root_dir=str(out_dir),
         log_every_n_steps=50,
         gradient_clip_val=1.0,
+        # _MetricsLogger prints clean per-epoch summaries; Lightning's tqdm bar is
+        # redundant and floods piped stdout with carriage-return spam (which makes
+        # the trainer UI's live log/progress lag badly).
+        enable_progress_bar=False,
     )
 
     # Resume: restore full state (weights, optimizer, epoch, LR scheduler)

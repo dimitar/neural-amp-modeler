@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 
 import gradio as gr
@@ -172,12 +173,13 @@ def build_app():
                     yield f"⚠️ Could not start training: {e}", "", None, box
                     return
                 box["proc"] = proc
-                buffer, records, cur, last_fig = "", [], None, None
-                progress = "⏳ Preparing data and starting training… (the first "
-                progress += "epoch can take a while at 96 kHz)"
-                yield buffer, progress, None, box
+                log_lines = deque(maxlen=400)  # bound the streamed log payload
+                records, cur, last_fig = [], None, None
+                progress = ("⏳ Preparing data and starting training… "
+                            "(the first epoch can take a while at 96 kHz)")
+                yield "", progress, None, box
                 for line in proc.stream():
-                    buffer += line + "\n"
+                    log_lines.append(line)
                     ev = rn.parse_progress_line(line)
                     plot_out = gr.update()
                     if ev and ev["type"] == "epoch":
@@ -190,10 +192,11 @@ def build_app():
                         cur[ev["name"]] = ev["value"]
                         last_fig = loss_figure(records)
                         plot_out = last_fig
-                    yield buffer, progress, plot_out, box
+                    yield "\n".join(log_lines), progress, plot_out, box
                 proc.wait()
-                buffer += f"\n[exited with code {proc.returncode}]\n"
-                yield buffer, progress, (last_fig if last_fig is not None else gr.update()), box
+                log_lines.append(f"[exited with code {proc.returncode}]")
+                yield ("\n".join(log_lines), progress,
+                       last_fig if last_fig is not None else gr.update(), box)
 
             start_btn.click(
                 do_train,
