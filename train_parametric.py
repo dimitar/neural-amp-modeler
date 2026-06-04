@@ -638,6 +638,33 @@ class _MetricsLogger(pl.callbacks.Callback):
         )
 
 
+def _write_per_capture_report(metrics, out_dir, architecture, epochs_trained):
+    """Write per-capture ESR report as JSON + markdown table."""
+    report = {
+        "architecture": architecture,
+        "epochs_trained": epochs_trained,
+        **metrics,
+    }
+    json_path = Path(out_dir) / "per_capture_esr.json"
+    json_path.write_text(json.dumps(report, indent=2))
+    print(f"\nPer-capture ESR report → {json_path}")
+
+    lines = [
+        "\n| cap | OD1 | OD2 | ESR mean |",
+        "|----:|----:|----:|---------:|",
+    ]
+    rows = sorted(
+        metrics["per_capture"].items(),
+        key=lambda kv: (kv[1]["od1"], kv[1]["od2"]),
+    )
+    for cap_num, vals in rows:
+        lines.append(
+            f"| {cap_num} | {vals['od1']} | {vals['od2']} | {vals['esr_mean']:.5f} |"
+        )
+    lines.append(f"\n**Mean ESR over {len(rows)} captures:** {metrics['mean_esr']:.5f}")
+    print("\n".join(lines))
+
+
 def do_train(args):
     """Train the parametric WaveNet model."""
     preset = _MODEL_PRESETS[args.model_size]
@@ -704,6 +731,14 @@ def do_train(args):
     if ckpt_path:
         print(f"Resuming from: {ckpt_path}")
     trainer.fit(lit_model, train_loader, val_loader, ckpt_path=ckpt_path)
+
+    if hasattr(lit_model, "_last_val_metrics") and lit_model._last_val_metrics is not None:
+        _write_per_capture_report(
+            lit_model._last_val_metrics,
+            out_dir=out_dir,
+            architecture=args.model_size,
+            epochs_trained=trainer.current_epoch + 1,
+        )
 
     # Load best checkpoint weights into model for the standalone .pt save
     if checkpoint_cb.best_model_path:
