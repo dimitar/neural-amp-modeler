@@ -491,6 +491,11 @@ def load_data(
     first_cap_path = data_dir / cap_pattern.format(cap_num=PARAM_TABLE[0][0])
     capture_info = sf.info(str(first_cap_path))
     target_rate = capture_info.samplerate
+    if target_rate != SAMPLE_RATE:
+        raise ValueError(
+            f"Capture sample rate {target_rate} Hz != expected sample rate "
+            f"{SAMPLE_RATE} Hz. Re-export captures at {SAMPLE_RATE} Hz."
+        )
     print(f"Input sample rate: {input_info.samplerate} Hz")
     print(f"Capture sample rate: {target_rate} Hz")
 

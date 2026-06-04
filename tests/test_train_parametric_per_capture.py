@@ -55,3 +55,20 @@ def test_compute_per_capture_metrics_groups_correctly():
     assert out["by_od2"]["4"]["n"] == 2
 
     assert out["mean_esr"] == pytest.approx((0.0133 + 0.045 + 0.02) / 3, abs=1e-3)
+
+
+def test_load_data_rejects_mismatched_sample_rate(tmp_path):
+    """load_data must fail loudly if any capture's SR != SAMPLE_RATE."""
+    import soundfile as sf
+    import numpy as np
+    from train_parametric import load_data, SAMPLE_RATE
+
+    sf.write(str(tmp_path / "input.wav"), np.zeros(SAMPLE_RATE), SAMPLE_RATE)
+    sf.write(
+        str(tmp_path / "1 ADA MP-1 NAM.wav"),
+        np.zeros(44100),
+        44100,
+    )
+
+    with pytest.raises((AssertionError, ValueError), match=r"(?i)sample.?rate"):
+        load_data(tmp_path, nx=64)
