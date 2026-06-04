@@ -147,23 +147,56 @@ _FILM_PARAMS = {
 
 
 def _build_layer_configs(model_size):
-    """Build LAYER_CONFIGS for the given preset name."""
+    """Build layer_configs list for the given preset name.
+
+    Supports presets with:
+    - Scalar "kernel_size" (broadcast to all layers) or per-layer "kernel_sizes" list.
+    - String "activation" optionally combined with "activation_kwargs" dict (e.g. for
+      LeakyReLU), assembled into a dict that _LayerArray.init_from_config accepts.
+    - Variable number of layer arrays: len(channels) arrays, not hardcoded to 2.
+
+    head_kernel_size is stored in the preset for export purposes but is NOT passed to
+    _LayerArray.init_from_config (HeadRechannel always uses kernel_size=1 internally).
+    """
     p = _MODEL_PRESETS[model_size]
-    ch1, ch2 = p["channels"]
+    channels = p["channels"]
     cs = p["condition_size"]
-    hs1, hs2 = p["head_size"]
-    common = {
-        "kernel_size": 3,
-        "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-        "activation": "Tanh",
-        "film_params": _FILM_PARAMS,
-    }
-    return [
-        {"input_size": 1, "condition_size": cs, "head_size": hs1,
-         "channels": ch1, **common},
-        {"input_size": ch1, "condition_size": cs, "head_size": hs2,
-         "channels": ch2, **common},
-    ]
+    head_sizes = p["head_size"]
+
+    # Activation: string + optional kwargs → dict form that _LayerArray accepts.
+    activation_str = p["activation"]
+    activation_kwargs = p.get("activation_kwargs")
+    if activation_kwargs:
+        activation = {"name": activation_str, **activation_kwargs}
+    else:
+        activation = activation_str
+
+    # Kernel sizes: prefer per-layer list, fall back to scalar broadcast.
+    if "kernel_sizes" in p:
+        kernel_field = {"kernel_sizes": p["kernel_sizes"]}
+    else:
+        kernel_field = {"kernel_size": p["kernel_size"]}
+
+    dilations = p["dilations"]
+
+    layer_configs = []
+    for i, (ch, hs) in enumerate(zip(channels, head_sizes)):
+        input_size = 1 if i == 0 else channels[i - 1]
+        layer_configs.append({
+            "input_size": input_size,
+            "condition_size": cs,
+            "head_size": hs,
+            "channels": ch,
+            **kernel_field,
+            "dilations": dilations,
+            "activation": activation,
+            "film_params": _FILM_PARAMS,
+            # Metadata for export; not read by _LayerArray.init_from_config
+            # (HeadRechannel always uses kernel_size=1 internally).
+            "_head_kernel_size": p.get("head_kernel_size", 1),
+        })
+
+    return layer_configs
 
 
 def normalize_params(od1, od2):
@@ -236,6 +269,8 @@ class ParametricWaveNet(nn.Module):
             nn.Linear(condition_size, condition_size),
             nn.Tanh(),
         )
+        # Store originals for export (includes _head_kernel_size metadata).
+        self._layer_configs = list(layer_configs)
         configs_with_position = []
         for i, lc in enumerate(layer_configs):
             c = {**lc, "is_first": i == 0, "is_last": i == len(layer_configs) - 1}
@@ -917,8 +952,21 @@ def export_nam(model, output_path, sample_rate):
         ],
     }
 
-    # WaveNet config (reuses NAM's export_config which handles FiLM)
-    layers_config = [la.export_config() for la in model._layer_arrays]
+    # WaveNet config (reuses NAM's export_config which handles FiLM).
+    # Augment each exported layer config with a "head" dict that carries the
+    # head_kernel_size stored in _layer_configs (HeadRechannel's kernel is always 1
+    # internally; head_kernel_size > 1 is metadata for the C++ loader).
+    layers_config = []
+    for i, la in enumerate(model._layer_arrays):
+        exported = la.export_config()
+        orig = model._layer_configs[i] if i < len(model._layer_configs) else {}
+        head_ks = orig.get("_head_kernel_size", 1)
+        exported["head"] = {
+            "out_channels": exported["head_size"],
+            "kernel_size": head_ks,
+            "bias": exported.get("head_bias", True),
+        }
+        layers_config.append(exported)
     head_config = None if model._head is None else model._head.export_config()
 
     # Flatten all weights: param_encoder first, then WaveNet

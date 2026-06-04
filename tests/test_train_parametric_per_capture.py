@@ -97,6 +97,31 @@ def test_load_data_rejects_mismatched_sample_rate_on_later_capture(tmp_path):
         load_data(tmp_path, nx=64)
 
 
+@pytest.mark.parametrize("preset_name", ["small", "small_k16head", "a2_small"])
+def test_preset_constructs_and_forward_passes(preset_name):
+    """Each preset must construct a ParametricWaveNet that runs a forward pass."""
+    from train_parametric import (
+        _build_layer_configs,
+        ParametricWaveNet,
+        _MODEL_PRESETS,
+    )
+
+    preset = _MODEL_PRESETS[preset_name]
+    layer_configs = _build_layer_configs(preset_name)
+    model = ParametricWaveNet(
+        layer_configs,
+        head_config=None,
+        head_scale=preset["head_scale"],
+        num_params=2,
+        condition_size=preset["condition_size"],
+    )
+    # Forward pass with enough samples to exceed the receptive field
+    params = torch.zeros(1, 2)
+    x = torch.zeros(1, 4096)
+    y = model(params, x, pad_start=True)
+    assert y.shape == (1, 4096), f"Expected (1, 4096), got {y.shape}"
+
+
 def test_a2_constants_match_upstream():
     """Detect silent drift if upstream changes the A2 config."""
     import subprocess
