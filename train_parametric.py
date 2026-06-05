@@ -30,6 +30,8 @@ from nam.models.losses import apply_pre_emphasis_filter, esr
 from nam.models.wavenet._layer_array import LayerArray as _LayerArray
 from nam.models.wavenet._wavenet import _Head
 
+from capture_naming import _detect_capture_pattern, _resolve_capture_pattern
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 48_000
@@ -107,8 +109,10 @@ _MODEL_PRESETS["a2_small"] = {
     "head_scale": 0.01,
 }
 
-# (capture_number, OD1, OD2)
-# 5x5 grid: OD2 varies by group (2,4,6,8,10), OD1 varies within group.
+# Legacy reference mapping for the ADA MP-1 Tube-Dist 5x5 grid.
+# The training pipeline now reads params.json from each dataset directory;
+# this constant is retained for parse_rtf.py and the _LEGACY_TUBE_DIST_CONFIG
+# fallback used by old checkpoints. (capture_number, OD1, OD2).
 # Capture 6: RTF listed (4,4) in error; actual settings are OD1=2, OD2=4.
 PARAM_TABLE = [
     (1, 2, 2),
@@ -202,9 +206,48 @@ def _build_layer_configs(model_size):
     return layer_configs
 
 
-def normalize_params(od1, od2):
-    """Normalize knob values from [2, 10] to [0, 1]."""
-    return (od1 - 2) / 8, (od2 - 2) / 8
+def normalize_params(values, param_specs):
+    """Normalize knob values to [0, 1] using each param's [minimum, maximum].
+
+    :param values: Iterable of float knob values in source units.
+    :param param_specs: List of {"name", "minimum", "maximum"} dicts in the
+        same order as values.
+    :return: List of floats in [0, 1].
+    """
+    return [
+        (float(v) - p["minimum"]) / (p["maximum"] - p["minimum"])
+        for v, p in zip(values, param_specs)
+    ]
+
+
+def _load_params_config(data_dir):
+    """Read params.json from a dataset directory.
+
+    The file describes the knob schema (name + range per knob) and the
+    capture-to-knob-value mapping. Required for both training and the
+    .nam export's param_encoder metadata.
+    """
+    cfg_path = Path(data_dir) / "params.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(
+            f"Missing {cfg_path}. Each dataset directory must include a "
+            "params.json describing knob ranges and the capture mapping."
+        )
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    if "params" not in cfg or "captures" not in cfg:
+        raise ValueError(
+            f"{cfg_path} must define 'params' and 'captures' keys."
+        )
+    # Sanity: capture values must match number of params
+    n_params = len(cfg["params"])
+    for entry in cfg["captures"]:
+        if len(entry["values"]) != n_params:
+            raise ValueError(
+                f"{cfg_path}: capture {entry['capture']} has "
+                f"{len(entry['values'])} values, expected {n_params}."
+            )
+    return cfg
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
@@ -354,48 +397,58 @@ class ParametricWaveNet(nn.Module):
 # ─── Per-capture metrics ──────────────────────────────────────────────────────
 
 
-def _compute_per_capture_metrics(errors_by_capture, capture_table):
-    """Aggregate per-sample errors by capture, OD1, OD2.
+def _compute_per_capture_metrics(errors_by_capture, capture_table, param_specs):
+    """Aggregate per-sample errors by capture and by each knob param.
 
     ESR is computed with pre-emphasis (PRE_EMPH_COEF=0.85), matching training
     loss. Keys are suffixed with `_pe` to distinguish from plain val_ESR.
 
     Args:
-        errors_by_capture: dict[capture_idx, list[float]] of ESR per sample
-        capture_table: list of dicts with cap_num, od1, od2 (index = capture_idx)
+        errors_by_capture: dict[capture_idx, list[float]] of ESR per sample.
+        capture_table: list of dicts with "capture" (int) and "values"
+            (list[float], length == len(param_specs)). Indexed by capture_idx.
+        param_specs: list of {"name", "minimum", "maximum"} dicts in the same
+            order as capture_table[i]["values"]. Used to label per-param buckets.
 
     Returns:
-        dict with keys: per_capture, by_od1, by_od2, by_od1_od2, mean_esr_pe
+        per_capture:   {"<cap_num>": {<param_name>: float, ..., "esr_pe_mean": float,
+                       "esr_pe_max": float, "n_samples": int}}
+        by_<param>:    {"<value>": {"esr_pe_mean": float, "esr_pe_max": float, "n": int}}
+                       — one such key per param in param_specs.
+        by_combined:   {"<v1>_<v2>_..._<vN>": {"esr_pe_mean": float, "esr_pe_max": float,
+                       "n": int}} — params joined by underscore (back-compat with
+                       the original 2-param "by_od1_od2" shape).
+        mean_esr_pe:   float
     """
     per_capture = {}
-    by_od1 = {}
-    by_od2 = {}
-    by_od1_od2 = {}
+    # One per-param bucket, keyed by the param name.
+    by_param = {p["name"]: {} for p in param_specs}
+    by_combined = {}
 
     capture_means = []
     for cap_idx, samples in errors_by_capture.items():
         if not samples:
             continue
         meta = capture_table[cap_idx]
-        cap_num = str(meta["cap_num"])
-        od1 = str(meta["od1"])
-        od2 = str(meta["od2"])
-        bucket = f"{od1}_{od2}"
+        cap_num = str(meta["capture"])
+        values = meta["values"]
+        # String keys for bucket dicts (JSON-friendly + stable across types).
+        value_strs = [_fmt_param_value(v) for v in values]
+        combined_key = "_".join(value_strs)
 
         mean_esr = float(np.mean(samples))
         max_esr = float(np.max(samples))
         capture_means.append(mean_esr)
 
-        per_capture[cap_num] = {
-            "od1": meta["od1"],
-            "od2": meta["od2"],
-            "esr_pe_mean": mean_esr,
-            "esr_pe_max": max_esr,
-            "n_samples": len(samples),
-        }
-        by_od1.setdefault(od1, []).append(mean_esr)
-        by_od2.setdefault(od2, []).append(mean_esr)
-        by_od1_od2.setdefault(bucket, []).append(mean_esr)
+        entry = {p["name"]: v for p, v in zip(param_specs, values)}
+        entry["esr_pe_mean"] = mean_esr
+        entry["esr_pe_max"] = max_esr
+        entry["n_samples"] = len(samples)
+        per_capture[cap_num] = entry
+
+        for p, vs in zip(param_specs, value_strs):
+            by_param[p["name"]].setdefault(vs, []).append(mean_esr)
+        by_combined.setdefault(combined_key, []).append(mean_esr)
 
     def _agg(d):
         return {
@@ -403,13 +456,30 @@ def _compute_per_capture_metrics(errors_by_capture, capture_table):
             for k, v in d.items()
         }
 
-    return {
-        "per_capture": per_capture,
-        "by_od1": _agg(by_od1),
-        "by_od2": _agg(by_od2),
-        "by_od1_od2": _agg(by_od1_od2),
-        "mean_esr_pe": float(np.mean(capture_means)) if capture_means else 0.0,
-    }
+    out = {"per_capture": per_capture}
+    for name, buckets in by_param.items():
+        out[f"by_{name}"] = _agg(buckets)
+    out["by_combined"] = _agg(by_combined)
+    out["mean_esr_pe"] = (
+        float(np.mean(capture_means)) if capture_means else 0.0
+    )
+    return out
+
+
+def _fmt_param_value(v):
+    """Render a knob value for use as a JSON dict key.
+
+    Integers (incl. 2.0, 4.0) render without a trailing ".0"; non-integer
+    floats render with their natural repr. Keeps the back-compat "2_4" / "4_4"
+    bucket keys for the ADA MP-1 case where knob values are integral.
+    """
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, (int,)):
+        return str(v)
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
 
 
 # ─── Lightning Module ─────────────────────────────────────────────────────────
@@ -417,13 +487,18 @@ def _compute_per_capture_metrics(errors_by_capture, capture_table):
 
 class ParametricLightningModule(pl.LightningModule):
     def __init__(self, model, lr=LR, lr_gamma=LR_GAMMA,
-                 warmup_epochs=LR_WARMUP_EPOCHS, capture_table=None):
+                 warmup_epochs=LR_WARMUP_EPOCHS, capture_table=None,
+                 param_specs=None):
         super().__init__()
         self._model = model
         self._lr = lr
         self._lr_gamma = lr_gamma
         self._warmup_epochs = warmup_epochs
+        # capture_table and param_specs travel together: the former gives each
+        # capture's parameter values (by index), the latter labels each value's
+        # position. Either being empty/None means we skip per-capture logging.
         self._capture_table = capture_table or []
+        self._param_specs = param_specs or []
         self._val_errors_by_capture = {}
         self._last_val_metrics = None
 
@@ -464,11 +539,13 @@ class ParametricLightningModule(pl.LightningModule):
         return loss_mse
 
     def on_validation_epoch_end(self):
-        if not self._val_errors_by_capture or not self._capture_table:
+        if (not self._val_errors_by_capture
+                or not self._capture_table
+                or not self._param_specs):
             self._val_errors_by_capture = {}
             return
         metrics = _compute_per_capture_metrics(
-            self._val_errors_by_capture, self._capture_table
+            self._val_errors_by_capture, self._capture_table, self._param_specs
         )
         self._last_val_metrics = metrics
 
@@ -529,29 +606,6 @@ class ParametricLightningModule(pl.LightningModule):
 # ─── Data Loading ─────────────────────────────────────────────────────────────
 
 
-def _detect_capture_pattern(data_dir):
-    """Auto-detect the WAV filename pattern from the data directory."""
-    data_dir = Path(data_dir)
-    # Try known patterns in order
-    patterns = [
-        "{cap_num} ADA MP-1 NAM.wav",
-        "{cap_num} ADA MP-1 PS2 96khz.wav",
-    ]
-    for pat in patterns:
-        test_path = data_dir / pat.format(cap_num=1)
-        if test_path.exists():
-            return pat
-    # Fallback: find any WAV starting with "1 "
-    for f in data_dir.glob("1 *.wav"):
-        if f.name != "input.wav":
-            # Extract pattern by replacing leading "1 " with "{cap_num} "
-            return "{cap_num} " + f.name[2:]
-    raise FileNotFoundError(
-        f"Cannot detect capture WAV pattern in {data_dir}. "
-        "Expected files like '1 ADA MP-1 NAM.wav'."
-    )
-
-
 def _resample_tensor(x, from_rate, to_rate):
     """Resample a 1D tensor using linear interpolation."""
     if from_rate == to_rate:
@@ -566,15 +620,18 @@ def _resample_tensor(x, from_rate, to_rate):
 
 def load_data(
     data_dir,
+    param_config,
     nx,
     ny_train=NY,
     delay_samples=DELAY_SAMPLES,
     train_stop_seconds=None,
     val_start_seconds=None,
+    capture_pattern=None,
 ):
     """Load all WAV files, apply delay correction, and create train/val datasets.
 
     Args:
+        param_config: Loaded params.json dict (see _load_params_config).
         train_stop_seconds: Where to stop training data. Negative values are
             relative to end of file (e.g. -9.0 means stop 9s before end).
             None uses TRAIN_SECONDS from start.
@@ -582,12 +639,14 @@ def load_data(
             relative to end of file. None means immediately after training data.
     """
     data_dir = Path(data_dir)
-    cap_pattern = _detect_capture_pattern(data_dir)
+    captures = param_config["captures"]
+    param_specs = param_config["params"]
+    cap_pattern = _resolve_capture_pattern(data_dir, capture_pattern)
     print(f"Capture pattern: {cap_pattern}")
 
     # Detect sample rates
     input_info = sf.info(str(data_dir / "input.wav"))
-    first_cap_path = data_dir / cap_pattern.format(cap_num=PARAM_TABLE[0][0])
+    first_cap_path = data_dir / cap_pattern.format(cap_num=captures[0]["capture"])
     capture_info = sf.info(str(first_cap_path))
     target_rate = capture_info.samplerate
     if target_rate != SAMPLE_RATE:
@@ -608,26 +667,27 @@ def load_data(
 
     ys = []
     params_list = []
-    for cap_num, od1, od2 in PARAM_TABLE:
-        wav_path = data_dir / cap_pattern.format(cap_num=cap_num)
+    for entry in captures:
+        wav_path = data_dir / cap_pattern.format(cap_num=entry["capture"])
         cap_rate = sf.info(str(wav_path)).samplerate
         if cap_rate != SAMPLE_RATE:
             raise ValueError(
-                f"Capture {cap_num} sample rate {cap_rate} Hz != expected "
-                f"sample rate {SAMPLE_RATE} Hz ({wav_path.name}). "
+                f"Capture {entry['capture']} sample rate {cap_rate} Hz != "
+                f"expected sample rate {SAMPLE_RATE} Hz ({wav_path.name}). "
                 f"Re-export captures at {SAMPLE_RATE} Hz."
             )
         y = wav_to_tensor(wav_path)
         # Delay correction: output is behind input by delay_samples
         ys.append(y[delay_samples:])
-        params_list.append(normalize_params(od1, od2))
+        params_list.append(normalize_params(entry["values"], param_specs))
 
     if delay_samples > 0:
         x = x[:-delay_samples]
 
     for i, y in enumerate(ys):
         assert len(y) == len(x), (
-            f"Capture {PARAM_TABLE[i][0]}: length {len(y)} != input length {len(x)}"
+            f"Capture {captures[i]['capture']}: length {len(y)} "
+            f"!= input length {len(x)}"
         )
 
     total_samples = len(x)
@@ -705,6 +765,20 @@ class _MetricsLogger(pl.callbacks.Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         self._epoch_start = time.time()
 
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Emit a throttled per-step line (~20 per epoch) so a UI can show a
+        # within-epoch progress bar that visibly advances during long epochs.
+        total = trainer.num_training_batches
+        if not total or total == float("inf"):
+            return
+        total = int(total)
+        if batch_idx % max(1, total // 20) == 0 or batch_idx == total - 1:
+            print(
+                f"~step {batch_idx + 1}/{total} "
+                f"epoch {trainer.current_epoch}/{trainer.max_epochs}",
+                flush=True,
+            )
+
     def on_validation_epoch_end(self, trainer, pl_module):
         m = trainer.callback_metrics
         epoch = trainer.current_epoch
@@ -749,8 +823,14 @@ class _MetricsLogger(pl.callbacks.Callback):
         )
 
 
-def _write_per_capture_report(metrics, out_dir, architecture, epochs_trained):
-    """Write per-capture ESR report as JSON + markdown table."""
+def _write_per_capture_report(metrics, out_dir, architecture, epochs_trained,
+                              param_specs):
+    """Write per-capture ESR report as JSON + markdown table.
+
+    The markdown table has one column per knob in ``param_specs`` (so the
+    2-param ADA MP-1 case shows | cap | od1 | od2 | ESR(pe) mean | and an
+    N-param config shows N value columns).
+    """
     report = {
         "architecture": architecture,
         "epochs_trained": epochs_trained,
@@ -760,17 +840,18 @@ def _write_per_capture_report(metrics, out_dir, architecture, epochs_trained):
     json_path.write_text(json.dumps(report, indent=2))
     print(f"\nPer-capture ESR report → {json_path}")
 
-    lines = [
-        "\n| cap | OD1 | OD2 | ESR(pe) mean |",
-        "|----:|----:|----:|-------------:|",
-    ]
+    param_names = [p["name"] for p in param_specs]
+    header = "| cap | " + " | ".join(param_names) + " | ESR(pe) mean |"
+    sep = "|----:|" + "|".join(["----:"] * len(param_names)) + "|-------------:|"
+    lines = ["\n" + header, sep]
     rows = sorted(
         metrics["per_capture"].items(),
-        key=lambda kv: (kv[1]["od1"], kv[1]["od2"]),
+        key=lambda kv: tuple(kv[1][n] for n in param_names),
     )
     for cap_num, vals in rows:
+        value_cells = " | ".join(str(vals[n]) for n in param_names)
         lines.append(
-            f"| {cap_num} | {vals['od1']} | {vals['od2']} | {vals['esr_pe_mean']:.5f} |"
+            f"| {cap_num} | {value_cells} | {vals['esr_pe_mean']:.5f} |"
         )
     lines.append(
         f"\n**Mean ESR(pe) over {len(rows)} captures:** {metrics['mean_esr_pe']:.5f}"
@@ -780,6 +861,14 @@ def _write_per_capture_report(metrics, out_dir, architecture, epochs_trained):
 
 def do_train(args):
     """Train the parametric WaveNet model."""
+    param_config = _load_params_config(args.data_dir)
+    n_params = len(param_config["params"])
+    n_captures = len(param_config["captures"])
+    print(
+        f"Loaded params.json: {n_params} knobs, {n_captures} captures "
+        f"({', '.join(p['name'] for p in param_config['params'])})"
+    )
+
     preset = _MODEL_PRESETS[args.model_size]
     layer_configs = _build_layer_configs(args.model_size)
     print(f"Model size: {args.model_size} "
@@ -789,6 +878,7 @@ def do_train(args):
     model = ParametricWaveNet(
         layer_configs=layer_configs,
         head_scale=HEAD_SCALE,
+        num_params=n_params,
         condition_size=preset["condition_size"],
     )
 
@@ -808,16 +898,27 @@ def do_train(args):
 
     train_loader, val_loader, target_rate = load_data(
         args.data_dir,
+        param_config,
         model.receptive_field,
         delay_samples=args.delay,
         train_stop_seconds=args.train_stop_seconds,
         val_start_seconds=args.val_start_seconds,
+        capture_pattern=args.capture_pattern,
     )
+    # capture_table mirrors ParametricDataset's per-capture order. Each entry
+    # carries the raw (un-normalized) param values so the per-capture report
+    # shows source-unit knob settings (e.g. OD1=2, OD2=4), not the [0,1]
+    # normalized values the model actually sees.
     capture_table = [
-        {"cap_num": cap_num, "od1": od1, "od2": od2}
-        for cap_num, od1, od2 in PARAM_TABLE
+        {"capture": int(entry["capture"]),
+         "values": [float(v) for v in entry["values"]]}
+        for entry in param_config["captures"]
     ]
-    lit_model = ParametricLightningModule(model, lr=args.lr, capture_table=capture_table)
+    param_specs = param_config["params"]
+    lit_model = ParametricLightningModule(
+        model, lr=args.lr,
+        capture_table=capture_table, param_specs=param_specs,
+    )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -837,6 +938,10 @@ def do_train(args):
         default_root_dir=str(out_dir),
         log_every_n_steps=50,
         gradient_clip_val=1.0,
+        # _MetricsLogger prints clean per-epoch summaries; Lightning's tqdm bar is
+        # redundant and floods piped stdout with carriage-return spam (which makes
+        # the trainer UI's live log/progress lag badly).
+        enable_progress_bar=False,
     )
 
     # Resume: restore full state (weights, optimizer, epoch, LR scheduler)
@@ -851,6 +956,7 @@ def do_train(args):
             out_dir=out_dir,
             architecture=args.model_size,
             epochs_trained=trainer.current_epoch + 1,
+            param_specs=param_specs,
         )
 
     # Load best checkpoint weights into model for the standalone .pt save
@@ -876,6 +982,7 @@ def do_train(args):
             "receptive_field": model.receptive_field,
             "model_size": args.model_size,
             "sample_rate": target_rate,
+            "param_config": param_config,
         },
         save_path,
     )
@@ -888,10 +995,14 @@ def do_train(args):
 def do_infer(args):
     """Run inference with a trained parametric WaveNet model."""
     ckpt = torch.load(args.checkpoint, weights_only=False)
+    param_config = ckpt.get("param_config") or _LEGACY_TUBE_DIST_CONFIG
+    param_specs = param_config["params"]
+
     model = ParametricWaveNet(
         layer_configs=ckpt["layer_configs"],
         head_config=ckpt["head_config"],
         head_scale=ckpt["head_scale"],
+        num_params=len(param_specs),
         condition_size=ckpt["condition_size"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
@@ -901,17 +1012,37 @@ def do_infer(args):
     model = model.to(device)
 
     x = wav_to_tensor(args.input_wav).to(device)
-    od1_n, od2_n = normalize_params(args.od1, args.od2)
-    params = torch.tensor([[od1_n, od2_n]], dtype=torch.float32, device=device)
+    raw_values = [args.od1, args.od2]
+    for v, spec in zip(raw_values, param_specs):
+        if not (spec["minimum"] <= v <= spec["maximum"]):
+            raise SystemExit(
+                f"{spec['name']}={v} is outside the trained range "
+                f"[{spec['minimum']}, {spec['maximum']}]."
+            )
+    normalized = normalize_params(raw_values, param_specs)
+    params = torch.tensor([normalized], dtype=torch.float32, device=device)
+    sample_rate = ckpt.get("sample_rate", SAMPLE_RATE)
 
-    print(f"Input: {len(x)} samples ({len(x) / SAMPLE_RATE:.1f}s)")
-    print(f"OD1={args.od1} ({od1_n:.3f}), OD2={args.od2} ({od2_n:.3f})")
+    print(f"Input: {len(x)} samples ({len(x) / sample_rate:.1f}s @ {sample_rate} Hz)")
+    for raw, n, spec in zip(raw_values, normalized, param_specs):
+        print(f"{spec['name']}={raw} ({n:.3f}) range=[{spec['minimum']}, {spec['maximum']}]")
 
     with torch.no_grad():
         y = model(params, x.unsqueeze(0), pad_start=True).squeeze(0)
 
-    tensor_to_wav(y, args.output_wav, rate=SAMPLE_RATE)
+    tensor_to_wav(y, args.output_wav, rate=sample_rate)
     print(f"Output saved to {args.output_wav}")
+
+
+# Used as a fallback when loading legacy .pt checkpoints that pre-date
+# the param_config field. The original hardcoded mapping was Tube-Dist.
+_LEGACY_TUBE_DIST_CONFIG = {
+    "params": [
+        {"name": "OD1", "minimum": 2.0, "maximum": 10.0},
+        {"name": "OD2", "minimum": 2.0, "maximum": 10.0},
+    ],
+    "captures": [{"capture": c, "values": [o1, o2]} for c, o1, o2 in PARAM_TABLE],
+}
 
 
 # ─── Export to .nam ───────────────────────────────────────────────────────
@@ -937,12 +1068,16 @@ def _export_wavenet_weights(model):
     return weights
 
 
-def export_nam(model, output_path, sample_rate):
+def export_nam(model, output_path, sample_rate, param_specs):
     """Export a trained ParametricWaveNet to .nam JSON format.
 
     Weight order: [param_encoder_weights..., wavenet_weights..., head_scale]
     The C++ loader should read param_encoder weights first (based on
     param_encoder config), then the standard WaveNet weights.
+
+    :param param_specs: List of {"name", "minimum", "maximum"} dicts in the
+        order matching the model's input parameters. Embedded into the .nam's
+        param_encoder.params so the plugin shows correct knob ranges.
     """
     model.eval()
     model.cpu()
@@ -950,14 +1085,23 @@ def export_nam(model, output_path, sample_rate):
     # Param encoder config
     linear1 = model._param_encoder[0]
     linear2 = model._param_encoder[2]
+    if linear1.in_features != len(param_specs):
+        raise ValueError(
+            f"Model has {linear1.in_features} input params but param_specs "
+            f"has {len(param_specs)}. These must match."
+        )
     param_encoder_config = {
         "num_params": linear1.in_features,
         "hidden_size": linear1.out_features,
         "condition_size": linear2.out_features,
         "activation": "Tanh",
         "params": [
-            {"name": "OD1", "minimum": 2.0, "maximum": 10.0},
-            {"name": "OD2", "minimum": 2.0, "maximum": 10.0},
+            {
+                "name": p["name"],
+                "minimum": float(p["minimum"]),
+                "maximum": float(p["maximum"]),
+            }
+            for p in param_specs
         ],
     }
 
@@ -1017,11 +1161,21 @@ def do_export(args):
             raise SystemExit("--random-init requires --model-size")
         preset = _MODEL_PRESETS[args.model_size]
         layer_configs = _build_layer_configs(args.model_size)
+        # Random-init is for generating C++ test fixtures, so there's no
+        # dataset (and no params.json) to read. Default to the 2-param
+        # ADA MP-1 schema with normalized [0, 1] ranges — the C++ test runner
+        # feeds normalized values directly and doesn't care about the source
+        # units. Override with --random-init-params if a fixture needs more.
+        num_params = 2
+        param_specs = [
+            {"name": f"p{i}", "minimum": 0.0, "maximum": 1.0}
+            for i in range(num_params)
+        ]
         model = ParametricWaveNet(
             layer_configs=layer_configs,
             head_config=None,
             head_scale=preset["head_scale"],
-            num_params=2,
+            num_params=num_params,
             condition_size=preset["condition_size"],
         )
         # Override the identity-FiLM init with random scale/shift so the test
@@ -1046,16 +1200,19 @@ def do_export(args):
                         nn.init.normal_(film._film.bias, mean=0.0, std=0.05)
         sample_rate = args.sample_rate if args.sample_rate is not None else SAMPLE_RATE
         print(f"Random-init {args.model_size} preset @ {sample_rate} Hz")
-        export_nam(model, args.output, sample_rate)
+        export_nam(model, args.output, sample_rate, param_specs)
         return
 
     if not args.checkpoint:
         raise SystemExit("--checkpoint is required when --random-init is not set")
     ckpt = torch.load(args.checkpoint, weights_only=False)
+    param_config = ckpt.get("param_config") or _LEGACY_TUBE_DIST_CONFIG
+    param_specs = param_config["params"]
     model = ParametricWaveNet(
         layer_configs=ckpt["layer_configs"],
         head_config=ckpt["head_config"],
         head_scale=ckpt["head_scale"],
+        num_params=len(param_specs),
         condition_size=ckpt["condition_size"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
@@ -1068,7 +1225,13 @@ def do_export(args):
             )
         sample_rate = args.sample_rate
     print(f"Sample rate: {sample_rate} Hz")
-    export_nam(model, args.output, sample_rate)
+    print(
+        "Knobs: "
+        + ", ".join(
+            f"{p['name']}=[{p['minimum']}, {p['maximum']}]" for p in param_specs
+        )
+    )
+    export_nam(model, args.output, sample_rate, param_specs)
     print(f"\nTo load in C++, parse param_encoder weights first ({model._param_encoder[0].in_features} -> "
           f"{model._param_encoder[2].out_features} MLP with Tanh), "
           f"then standard WaveNet weights.")
@@ -1144,6 +1307,14 @@ def main():
         f"'small' ~26K params, 'large' ~101K params. Must match the preset "
         f"used to train a checkpoint when --resume is used.",
     )
+    tp.add_argument(
+        "--capture-pattern",
+        default=None,
+        metavar="TEMPLATE",
+        help="Explicit capture WAV filename template with a '{cap_num}' "
+        "placeholder, e.g. 'MP-1 3TM NAM Amp DI {cap_num}.wav'. Overrides "
+        "auto-detection; use when the capture number isn't a leading prefix.",
+    )
 
     ep = sub.add_parser("export", help="Export .pt model to .nam format")
     ep.add_argument("--checkpoint", required=False, help="Path to .pt model file (omitted with --random-init)")
@@ -1178,10 +1349,12 @@ def main():
     ip.add_argument("--input-wav", required=True, help="Input WAV file (DI signal)")
     ip.add_argument("--output-wav", required=True, help="Output WAV file path")
     ip.add_argument(
-        "--od1", type=float, required=True, help="OD1 knob value (2-10)"
+        "--od1", type=float, required=True,
+        help="OD1 knob value (must be within the trained range from the checkpoint)"
     )
     ip.add_argument(
-        "--od2", type=float, required=True, help="OD2 knob value (2-10)"
+        "--od2", type=float, required=True,
+        help="OD2 knob value (must be within the trained range from the checkpoint)"
     )
 
     args = parser.parse_args()

@@ -25,13 +25,24 @@ def test_paramdataset_returns_capture_id():
 
 
 def test_compute_per_capture_metrics_groups_correctly():
-    """Helper bins per-sample ESR back to captures and aggregates by OD1, OD2."""
+    """Helper bins per-sample ESR back to captures and aggregates by each param.
+
+    Covers the generalized N-knob schema: capture_table entries carry
+    {"capture", "values"}, param_specs labels each value column, and the
+    output contains one by_<name> bucket per param plus by_combined.
+    For the 2-knob ADA MP-1 case here the buckets reduce to the same numbers
+    as the pre-refactor by_od1 / by_od2 / by_od1_od2 contract.
+    """
     from train_parametric import _compute_per_capture_metrics
 
+    param_specs = [
+        {"name": "od1", "minimum": 2, "maximum": 10},
+        {"name": "od2", "minimum": 2, "maximum": 10},
+    ]
     capture_table = [
-        {"cap_num": 1, "od1": 2, "od2": 4},
-        {"cap_num": 2, "od1": 4, "od2": 4},
-        {"cap_num": 3, "od1": 2, "od2": 6},
+        {"capture": 1, "values": [2, 4]},
+        {"capture": 2, "values": [4, 4]},
+        {"capture": 3, "values": [2, 6]},
     ]
     errors_by_capture = {
         0: [0.01, 0.02, 0.01],
@@ -39,9 +50,11 @@ def test_compute_per_capture_metrics_groups_correctly():
         2: [0.02],
     }
 
-    out = _compute_per_capture_metrics(errors_by_capture, capture_table)
+    out = _compute_per_capture_metrics(errors_by_capture, capture_table, param_specs)
 
     assert out["per_capture"]["1"]["esr_pe_mean"] == pytest.approx(0.0133, abs=1e-3)
+    assert out["per_capture"]["1"]["od1"] == 2
+    assert out["per_capture"]["1"]["od2"] == 4
     assert out["per_capture"]["2"]["esr_pe_mean"] == pytest.approx(0.045)
     assert out["per_capture"]["3"]["esr_pe_mean"] == pytest.approx(0.02)
 
@@ -52,19 +65,39 @@ def test_compute_per_capture_metrics_groups_correctly():
     assert out["by_od2"]["4"]["esr_pe_mean"] == pytest.approx(0.02917, abs=1e-3)
     assert out["by_od2"]["4"]["n"] == 2
 
-    assert out["by_od1_od2"]["2_4"]["esr_pe_mean"] == pytest.approx(0.0133, abs=1e-3)
-    assert out["by_od1_od2"]["2_4"]["n"] == 1
-    assert out["by_od1_od2"]["4_4"]["esr_pe_mean"] == pytest.approx(0.045)
-    assert out["by_od1_od2"]["2_6"]["esr_pe_mean"] == pytest.approx(0.02)
+    assert out["by_combined"]["2_4"]["esr_pe_mean"] == pytest.approx(0.0133, abs=1e-3)
+    assert out["by_combined"]["2_4"]["n"] == 1
+    assert out["by_combined"]["4_4"]["esr_pe_mean"] == pytest.approx(0.045)
+    assert out["by_combined"]["2_6"]["esr_pe_mean"] == pytest.approx(0.02)
 
     assert out["mean_esr_pe"] == pytest.approx((0.0133 + 0.045 + 0.02) / 3, abs=1e-3)
+
+
+def _write_minimal_params_json(dir_path, captures, names=("od1", "od2")):
+    """Write a 2-knob params.json matching the given captures list.
+
+    ``captures`` is a list of (cap_num, value_tuple) pairs. The values must
+    match the length of ``names``.
+    """
+    import json as _json
+    cfg = {
+        "params": [
+            {"name": n, "minimum": 2.0, "maximum": 10.0} for n in names
+        ],
+        "captures": [
+            {"capture": cap_num, "values": list(values)}
+            for cap_num, values in captures
+        ],
+    }
+    (dir_path / "params.json").write_text(_json.dumps(cfg))
+    return cfg
 
 
 def test_load_data_rejects_mismatched_sample_rate(tmp_path):
     """load_data must fail loudly if any capture's SR != SAMPLE_RATE."""
     import soundfile as sf
     import numpy as np
-    from train_parametric import load_data, SAMPLE_RATE
+    from train_parametric import load_data, SAMPLE_RATE, _load_params_config
 
     sf.write(str(tmp_path / "input.wav"), np.zeros(SAMPLE_RATE), SAMPLE_RATE)
     sf.write(
@@ -72,16 +105,20 @@ def test_load_data_rejects_mismatched_sample_rate(tmp_path):
         np.zeros(44100),
         44100,
     )
+    _write_minimal_params_json(tmp_path, [(1, (2, 2))])
+    param_config = _load_params_config(tmp_path)
 
     with pytest.raises((AssertionError, ValueError), match=r"(?i)sample.?rate"):
-        load_data(tmp_path, nx=64)
+        load_data(tmp_path, param_config, nx=64)
 
 
 def test_load_data_rejects_mismatched_sample_rate_on_later_capture(tmp_path):
     """load_data must validate ALL captures, not just the first one."""
     import soundfile as sf
     import numpy as np
-    from train_parametric import load_data, SAMPLE_RATE, PARAM_TABLE
+    from train_parametric import (
+        load_data, SAMPLE_RATE, PARAM_TABLE, _load_params_config,
+    )
 
     pattern = "{cap_num} ADA MP-1 NAM.wav"
     sf.write(str(tmp_path / "input.wav"), np.zeros(SAMPLE_RATE), SAMPLE_RATE)
@@ -93,9 +130,14 @@ def test_load_data_rejects_mismatched_sample_rate_on_later_capture(tmp_path):
             np.zeros(rate),
             rate,
         )
+    _write_minimal_params_json(
+        tmp_path,
+        [(cap_num, (od1, od2)) for cap_num, od1, od2 in PARAM_TABLE],
+    )
+    param_config = _load_params_config(tmp_path)
 
     with pytest.raises((AssertionError, ValueError), match=r"(?i)sample.?rate"):
-        load_data(tmp_path, nx=64)
+        load_data(tmp_path, param_config, nx=64)
 
 
 @pytest.mark.parametrize("preset_name", ["small", "small_k16head", "a2_small"])
@@ -205,7 +247,13 @@ def test_a2_export_json_includes_new_fields(tmp_path):
         condition_size=preset["condition_size"],
     )
     out = tmp_path / "a2.nam"
-    export_nam(model, str(out), sample_rate=48000)
+    export_nam(
+        model, str(out), sample_rate=48000,
+        param_specs=[
+            {"name": "OD1", "minimum": 2.0, "maximum": 10.0},
+            {"name": "OD2", "minimum": 2.0, "maximum": 10.0},
+        ],
+    )
     data = json.loads(out.read_text())
     # Export uses "layers" key (not "layers_configs")
     layer = data["config"]["layers"][0]
@@ -249,7 +297,13 @@ def test_small_k16head_export_json(tmp_path):
         condition_size=preset["condition_size"],
     )
     out = tmp_path / "k16head.nam"
-    export_nam(model, str(out), sample_rate=48000)
+    export_nam(
+        model, str(out), sample_rate=48000,
+        param_specs=[
+            {"name": "OD1", "minimum": 2.0, "maximum": 10.0},
+            {"name": "OD2", "minimum": 2.0, "maximum": 10.0},
+        ],
+    )
     data = json.loads(out.read_text())
     # Export uses "layers" key
     layers = data["config"]["layers"]

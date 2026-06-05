@@ -42,6 +42,11 @@ test = [
     "requests",
 ]
 
+ui = [
+    "gradio",
+    "pywebview",
+]
+
 [project.urls]
 homepage = "https://github.com/sdatkinson/"
 
