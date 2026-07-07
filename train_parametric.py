@@ -52,6 +52,16 @@ LR_WARMUP_EPOCHS = 5  # Linear LR ramp-up over first N epochs
 _MODEL_PRESETS = {
     "small": {"channels": (16, 8), "condition_size": 16, "head_size": (8, 1)},
     "large": {"channels": (32, 16), "condition_size": 32, "head_size": (16, 1)},
+    # small_k16head: identical to "small" but with the head convolution kernel
+    # bumped 1 -> 16 (A2's aliasing-reduction variable, isolated — same channels,
+    # dilations, and Tanh activation as "small"). Requires engine head_kernel_size
+    # support (present in MLEngineCore).
+    "small_k16head": {
+        "channels": (16, 8),
+        "condition_size": 16,
+        "head_size": (8, 1),
+        "head_kernel_size": 16,
+    },
 }
 DEFAULT_MODEL_SIZE = "small"
 
@@ -104,6 +114,10 @@ def _build_layer_configs(model_size):
         "kernel_size": 3,
         "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
         "activation": "Tanh",
+        # head_kernel_size > 1 backports upstream's aliasing-reduction head conv
+        # (see nam/models/wavenet/_layer_array.py). Default 1 preserves back-compat
+        # for "small"/"large".
+        "head_kernel_size": p.get("head_kernel_size", 1),
         "film_params": _FILM_PARAMS,
     }
     return [
@@ -227,7 +241,17 @@ class ParametricWaveNet(nn.Module):
 
     @property
     def receptive_field(self):
-        return 1 + sum(la.receptive_field - 1 for la in self._layer_arrays)
+        # Inter-array signal is the layer output x (not trimmed by head_rechannel);
+        # only the final array's head_rechannel kernel reduces the final output.
+        # Intermediate arrays therefore contribute their layers-only receptive
+        # field, the final array its full receptive field (incl. head kernel).
+        if not self._layer_arrays:
+            return 1
+        intermediate = sum(
+            la._layers_receptive_field - 1 for la in self._layer_arrays[:-1]
+        )
+        last = self._layer_arrays[-1].receptive_field - 1
+        return 1 + intermediate + last
 
     def forward(self, params, x, pad_start=True):
         """

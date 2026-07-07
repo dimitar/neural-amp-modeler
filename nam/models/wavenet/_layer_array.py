@@ -695,6 +695,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         dilations = config.pop("dilations")
         activation = config.pop("activation")
         head_bias = config.pop("head_bias", True)
+        head_kernel_size = config.pop("head_kernel_size", 1)  # default 1 for back-compat
         bottleneck = config.pop("bottleneck", channels)
 
         head1x1_config = _Head1x1Config.model_validate(
@@ -770,7 +771,11 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
             ]
         )
         head_rechannel = conv_factory_set.HeadRechannel(
-            head_rechannel_in_channels, head_size, 1, bias=head_bias, is_last=is_last
+            head_rechannel_in_channels,
+            head_size,
+            head_kernel_size,
+            bias=head_bias,
+            is_last=is_last,
         )
 
         return dict(
@@ -781,6 +786,26 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
 
     @property
     def receptive_field(self) -> int:
+        total = 1
+        for layer in self._layers:
+            assert isinstance(layer, _Layer)
+            total += (layer.kernel_size - 1) * layer.dilation
+        # head_rechannel is dilation=1; for kernel_size=1 (back-compat default)
+        # this adds 0. For backported kernel>1, it consumes (k-1) extra samples
+        # along the head_input branch. Note: when chaining multiple layer arrays,
+        # only the last array's head_rechannel actually trims final output (the
+        # inter-array signal is x, not head_input). Callers chaining LAs should
+        # use _layers_receptive_field for intermediate arrays.
+        total += self._head_rechannel.kernel_size[0] - 1
+        return total
+
+    @property
+    def _layers_receptive_field(self) -> int:
+        """Receptive field of just the dilated layers, excluding head_rechannel.
+
+        Use this when chaining layer arrays: the inter-array signal is the layer
+        output x, which is not trimmed by head_rechannel.
+        """
         total = 1
         for layer in self._layers:
             assert isinstance(layer, _Layer)
@@ -830,6 +855,7 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
             "input_size": self._rechannel.in_channels,
             "condition_size": first_layer.input_mixer.in_channels,
             "head_size": self._head_rechannel.out_channels,
+            "head_kernel_size": self._head_rechannel.kernel_size[0],
             "channels": first_layer.channels,
             "kernel_sizes": [layer.kernel_size for layer in self._layers],
             "dilations": self._dilations,
@@ -879,17 +905,28 @@ class LayerArray(_nn.Module, _InitializableFromConfig):
         :param c: (B,Dc,L) condition
 
         :return:
-            (B,Dc,L-R+1) head input
-            (B,Dc,L-R+1) layer output
+            (B,Dc,L-R+1)         head input  (post head_rechannel; final length)
+            (B,Dc,L-R+1+(k-1))   layer output (residual stream; k = head_rechannel
+                                 kernel size). Layers produce head_term at
+                                 out_length+(k-1) so that the kernel-k head conv
+                                 then yields exactly out_length samples; the
+                                 residual x is not trimmed by head_rechannel and
+                                 retains the extra (k-1) samples. When k=1 (the
+                                 default), the formula reduces to L-R+1 — back-compat.
         """
         out_length = min(x.shape[2], c.shape[2]) - (self.receptive_field - 1)
+        # Layers produce head_term at pre_head_length; head_rechannel (kernel k)
+        # then consumes (k-1) more samples so the final head output is out_length.
+        # For k=1 (default), pre_head_length == out_length (back-compat).
+        head_k = self._head_rechannel.kernel_size[0]
+        pre_head_length = out_length + (head_k - 1)
         x = self._rechannel(x)
         for layer in self._layers:
-            x, head_term = layer(x, c, out_length)  # Ensures head_term sample length
+            x, head_term = layer(x, c, pre_head_length)  # head_term has pre_head_length
             head_input = (
                 head_term
                 if head_input is None
-                else head_input[:, :, -out_length:] + head_term
+                else head_input[:, :, -pre_head_length:] + head_term
             )
         return self._head_rechannel(head_input), x
 
