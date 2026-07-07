@@ -49,6 +49,32 @@ def test_scan_suffix_autodetected(tmp_path):
     assert override.ready is True
 
 
+def test_scan_detects_no_csv(tmp_path):
+    (tmp_path / "input.wav").write_bytes(b"")
+    (tmp_path / "1 ADA MP-1 NAM.wav").write_bytes(b"")
+    status = ds.scan_dataset(tmp_path)
+    assert status.csv_files == []
+    # A missing CSV is not an error — params may be entered by hand.
+    assert status.ready is True
+
+
+def test_scan_detects_single_csv(tmp_path):
+    (tmp_path / "input.wav").write_bytes(b"")
+    (tmp_path / "1 ADA MP-1 NAM.wav").write_bytes(b"")
+    (tmp_path / "New ADA.csv").write_text("capture,OD1\n1,2\n")
+    status = ds.scan_dataset(tmp_path)
+    assert status.csv_files == ["New ADA.csv"]
+
+
+def test_scan_detects_multiple_csvs_sorted(tmp_path):
+    (tmp_path / "input.wav").write_bytes(b"")
+    (tmp_path / "1 ADA MP-1 NAM.wav").write_bytes(b"")
+    (tmp_path / "b.csv").write_text("capture,OD1\n1,2\n")
+    (tmp_path / "a.csv").write_text("capture,OD1\n1,2\n")
+    status = ds.scan_dataset(tmp_path)
+    assert status.csv_files == ["a.csv", "b.csv"]
+
+
 def test_scan_missing_input_wav(tmp_path):
     (tmp_path / "1 ADA MP-1 NAM.wav").write_bytes(b"")
     status = ds.scan_dataset(tmp_path)

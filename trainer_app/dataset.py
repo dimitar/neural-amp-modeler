@@ -36,6 +36,7 @@ class DatasetStatus:
     pattern: str | None = None
     capture_numbers: list[int] = field(default_factory=list)
     input_wav_present: bool = False
+    csv_files: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -56,6 +57,9 @@ def scan_dataset(data_dir, capture_pattern=None):
         return status
 
     status.input_wav_present = (d / "input.wav").exists()
+    # A params CSV is optional (params may be hand-entered), so detect it
+    # independently of pattern resolution and never treat its absence as an error.
+    status.csv_files = sorted(p.name for p in d.glob("*.csv"))
     names = [p.name for p in d.glob("*.wav") if p.name != "input.wav"]
 
     try:
