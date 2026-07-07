@@ -30,6 +30,17 @@ def captures_from_pattern(names, pattern):
     return sorted(set(nums))
 
 
+def name_for_capture(pattern, num):
+    """The capture filename for a capture number, per the detected pattern."""
+    return pattern.replace("{cap_num}", str(int(num)))
+
+
+def capture_for_name(pattern, name):
+    """The capture number embedded in a filename, or None if it doesn't match."""
+    m = pattern_to_regex(pattern).match(str(name).strip())
+    return int(m.group(1)) if m else None
+
+
 @dataclass
 class DatasetStatus:
     data_dir: str

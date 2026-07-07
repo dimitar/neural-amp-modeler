@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import signal
 import time
 from datetime import datetime
 from pathlib import Path
@@ -588,6 +589,54 @@ class _MetricsLogger(pl.callbacks.Callback):
         )
 
 
+class _StopFileCallback(pl.Callback):
+    """Request a graceful stop when a sentinel file appears.
+
+    The trainer UI (running under console-less pythonw) can't reliably deliver a
+    CTRL_BREAK on Windows, so Stop instead writes this file; we poll it each batch
+    and set trainer.should_stop, letting fit() finish the step and save.
+    """
+
+    def __init__(self, stop_file):
+        self.stop_file = Path(stop_file) if stop_file else None
+        self._announced = False
+
+    def _check(self, trainer):
+        if self.stop_file and self.stop_file.exists() and not self._announced:
+            print("Stop requested — finishing the current step, then saving…",
+                  flush=True)
+            self._announced = True
+            trainer.should_stop = True
+
+    def on_train_batch_end(self, trainer, *args):
+        self._check(trainer)
+
+    def on_train_epoch_end(self, trainer, *args):
+        self._check(trainer)
+
+
+def _install_graceful_stop(trainer):
+    """Make Stop (CTRL_BREAK on Windows / SIGINT) request a graceful stop so the
+    model is still saved.
+
+    Raising KeyboardInterrupt is NOT enough: Lightning catches it inside fit() and
+    calls sys.exit(1), skipping our save. And with no handler at all, Windows kills
+    the process abruptly (STATUS_CONTROL_C_EXIT). Setting trainer.should_stop lets
+    fit() finish the current step and return normally, so the save path below runs.
+    """
+    def _stop(signum, frame):
+        print("Stop requested — finishing the current step, then saving…",
+              flush=True)
+        trainer.should_stop = True
+
+    if hasattr(signal, "SIGBREAK"):  # Windows: the trainer UI sends CTRL_BREAK
+        signal.signal(signal.SIGBREAK, _stop)
+    try:
+        signal.signal(signal.SIGINT, _stop)
+    except (ValueError, OSError):
+        pass  # signal handlers can only be set from the main thread
+
+
 def do_train(args):
     """Train the parametric WaveNet model."""
     param_config = _load_params_config(args.data_dir)
@@ -650,7 +699,8 @@ def do_train(args):
         max_epochs=args.epochs,
         accelerator="auto",
         devices=1,
-        callbacks=[checkpoint_cb, _MetricsLogger()],
+        callbacks=[checkpoint_cb, _MetricsLogger(),
+                   _StopFileCallback(getattr(args, "stop_file", None))],
         default_root_dir=str(out_dir),
         log_every_n_steps=50,
         gradient_clip_val=1.0,
@@ -664,7 +714,10 @@ def do_train(args):
     ckpt_path = args.resume if args.resume else None
     if ckpt_path:
         print(f"Resuming from: {ckpt_path}")
+    _install_graceful_stop(trainer)
     trainer.fit(lit_model, train_loader, val_loader, ckpt_path=ckpt_path)
+    if trainer.should_stop:
+        print("Training stopped early — saving current model…", flush=True)
 
     # Load best checkpoint weights into model for the standalone .pt save
     if checkpoint_cb.best_model_path:
@@ -912,6 +965,12 @@ def main():
         "--output-dir",
         default="parametric_output",
         help="Output directory for checkpoints and model (default: parametric_output)",
+    )
+    tp.add_argument(
+        "--stop-file",
+        default=None,
+        help="Path to a sentinel file; when it appears, training stops gracefully "
+             "and saves. Used by the trainer UI's Stop button.",
     )
     tp.add_argument(
         "--epochs",

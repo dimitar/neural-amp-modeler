@@ -4,7 +4,6 @@
 
 import os
 import re
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -15,9 +14,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def build_train_command(
     data_dir, output_dir, *, model_size="small", delay=10, epochs=250,
     lr=4e-3, train_stop_seconds=-9.0, val_start_seconds=-9.0,
-    capture_pattern=None, python_exe=None, script="train_parametric.py",
+    capture_pattern=None, resume_ckpt=None, stop_file=None, python_exe=None,
+    script="train_parametric.py",
 ):
-    """Return the argv for a `train_parametric.py train` invocation."""
+    """Return the argv for a `train_parametric.py train` invocation.
+
+    resume_ckpt, when set, passes --resume so Lightning restores the full run
+    state (weights, optimizer, epoch, LR schedule) and continues up to --epochs.
+    stop_file, when set, passes --stop-file so the run stops gracefully (and
+    saves) when that sentinel file appears — how the UI's Stop button works.
+    """
     cmd = [
         python_exe or sys.executable, script, "train",
         "--data-dir", str(data_dir),
@@ -31,7 +37,25 @@ def build_train_command(
     ]
     if capture_pattern:
         cmd += ["--capture-pattern", capture_pattern]
+    if resume_ckpt:
+        cmd += ["--resume", str(resume_ckpt)]
+    if stop_file:
+        cmd += ["--stop-file", str(stop_file)]
     return cmd
+
+
+def list_checkpoints(output_dir):
+    """Return paths of `<output_dir>/checkpoints/*.ckpt`, newest first.
+
+    Training writes Lightning checkpoints here (see train_parametric.py's
+    ModelCheckpoint); the Train view lists them so a run can be resumed.
+    """
+    ckpt_dir = Path(output_dir) / "checkpoints"
+    if not ckpt_dir.is_dir():
+        return []
+    ckpts = sorted(ckpt_dir.glob("*.ckpt"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    return [str(p) for p in ckpts]
 
 
 def build_export_command(checkpoint, output, *, python_exe=None,
@@ -83,24 +107,33 @@ def parse_progress_line(line):
 class TrainProcess:
     """Manage the training subprocess with a graceful (model-saving) stop."""
 
-    def __init__(self, cmd, cwd=None):
+    def __init__(self, cmd, cwd=None, stop_file=None):
         self.cmd = cmd
         self.cwd = str(cwd or REPO_ROOT)
+        self.stop_file = Path(stop_file) if stop_file else None
         self._proc = None
 
     def start(self):
+        # Clear any stale stop sentinel so this run doesn't stop immediately.
+        if self.stop_file:
+            try:
+                self.stop_file.unlink()
+            except FileNotFoundError:
+                pass
         kwargs = {}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
-        # Force the child to flush stdout line-by-line. Without this, Python
-        # block-buffers stdout when it's a pipe, so progress (the log + the
-        # per-epoch progress bar) arrives in delayed bursts instead of live.
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        # Force the child to flush stdout line-by-line (PYTHONUNBUFFERED) and emit
+        # UTF-8. Decode with errors="replace" so a partial/garbled byte — e.g. left
+        # by an abruptly-killed child — can't raise UnicodeDecodeError and crash
+        # the streaming reader (which would surface as a red error box in the UI).
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         self._proc = subprocess.Popen(
             self.cmd, cwd=self.cwd, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1, env=env, **kwargs,
+            stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
+            bufsize=1, env=env, **kwargs,
         )
 
     def stream(self):
@@ -117,14 +150,21 @@ class TrainProcess:
             yield line.rstrip("\n")
 
     def stop(self):
-        """Send a graceful interrupt so train_parametric.py saves on shutdown."""
+        """Request a graceful stop by writing the sentinel file that
+        train_parametric.py polls (it then finishes the step and saves).
+
+        We deliberately do NOT send an OS signal: a Windows CTRL_BREAK kills the
+        trainer abruptly (no save) and can disrupt the piped log stream, while on
+        any platform a KeyboardInterrupt makes Lightning call sys.exit(1) and skip
+        the save. The sentinel file avoids all of that.
+        """
         if not self._proc or self._proc.poll() is not None:
             return
-        sig = signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT
-        try:
-            self._proc.send_signal(sig)
-        except OSError:
-            pass  # process exited between poll() and send_signal()
+        if self.stop_file:
+            try:
+                self.stop_file.write_text("stop")
+            except OSError:
+                pass
 
     def wait(self, timeout=None):
         if self._proc is None:

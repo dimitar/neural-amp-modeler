@@ -52,3 +52,11 @@ def test_params_summary_includes_warnings():
     assert "24 captures" in md
     assert "OD1, OD2" in md
     assert "[1, 6]" in md
+
+
+def test_derive_nam_name_replaces_spaces():
+    assert app._derive_nam_name("data/MP1 3TM") == "MP1_3TM.nam"
+
+
+def test_derive_nam_name_trailing_slash_and_no_spaces():
+    assert app._derive_nam_name("data/MP1-New/") == "MP1-New.nam"

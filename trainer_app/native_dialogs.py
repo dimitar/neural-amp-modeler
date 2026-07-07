@@ -7,6 +7,11 @@
 # None if neither is available or the user cancels.
 
 
+def _dir_arg(start_dir):
+    """Normalise a start directory for the native dialogs ('' means default)."""
+    return str(start_dir) if start_dir else ""
+
+
 def _from_webview(kind, **kwargs):
     """Try the pywebview native dialog.
 
@@ -49,25 +54,31 @@ def _from_tk(call):
         return None
 
 
-def pick_folder():
-    """Open a native folder-selection dialog. Returns a path str or None."""
-    res = _from_webview("folder")
+def pick_folder(start_dir=None):
+    """Open a native folder-selection dialog. Returns a path str or None.
+
+    :param start_dir: directory to open the dialog in (defaults to the OS default).
+    """
+    res = _from_webview("folder", directory=_dir_arg(start_dir))
     if res is not False:
         return res
-    return _from_tk(lambda fd: fd.askdirectory())
+    return _from_tk(lambda fd: fd.askdirectory(initialdir=_dir_arg(start_dir)))
 
 
-def pick_open_file(file_types=("All files (*.*)",)):
+def pick_open_file(file_types=("All files (*.*)",), start_dir=None):
     """Open a native open-file dialog. Returns a path str or None."""
-    res = _from_webview("open", file_types=file_types)
+    res = _from_webview("open", file_types=file_types, directory=_dir_arg(start_dir))
     if res is not False:
         return res
-    return _from_tk(lambda fd: fd.askopenfilename())
+    return _from_tk(lambda fd: fd.askopenfilename(initialdir=_dir_arg(start_dir)))
 
 
-def pick_save_file(default_name="model.nam", file_types=("NAM model (*.nam)",)):
+def pick_save_file(default_name="model.nam", file_types=("NAM model (*.nam)",),
+                   start_dir=None):
     """Open a native save-as dialog. Returns a path str or None."""
-    res = _from_webview("save", save_filename=default_name, file_types=file_types)
+    res = _from_webview("save", save_filename=default_name, file_types=file_types,
+                        directory=_dir_arg(start_dir))
     if res is not False:
         return res
-    return _from_tk(lambda fd: fd.asksaveasfilename(initialfile=default_name))
+    return _from_tk(lambda fd: fd.asksaveasfilename(
+        initialfile=default_name, initialdir=_dir_arg(start_dir)))

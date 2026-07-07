@@ -75,6 +75,18 @@ def test_scan_detects_multiple_csvs_sorted(tmp_path):
     assert status.csv_files == ["a.csv", "b.csv"]
 
 
+def test_name_for_capture_roundtrips():
+    pat = "MP-1 3TM NAM Amp DI {cap_num}.wav"
+    assert ds.name_for_capture(pat, 7) == "MP-1 3TM NAM Amp DI 7.wav"
+    assert ds.capture_for_name(pat, "MP-1 3TM NAM Amp DI 7.wav") == 7
+
+
+def test_capture_for_name_non_matching_is_none():
+    pat = "Amp {cap_num}.wav"
+    assert ds.capture_for_name(pat, "input.wav") is None
+    assert ds.capture_for_name(pat, "Amp seven.wav") is None
+
+
 def test_scan_missing_input_wav(tmp_path):
     (tmp_path / "1 ADA MP-1 NAM.wav").write_bytes(b"")
     status = ds.scan_dataset(tmp_path)

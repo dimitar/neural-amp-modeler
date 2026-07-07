@@ -19,7 +19,11 @@ def main():
         from trainer_app.app import build_app
 
         app = build_app()
-        app.queue()  # enable live streaming of generator outputs (training log/progress)
+        # Enable live streaming of generator outputs (training log/progress). Raise
+        # the concurrency limit so a blocking native file dialog (opened inside an
+        # event handler) doesn't stall other actions — the symptom being a button
+        # timer "counting up" while it waits its turn.
+        app.queue(default_concurrency_limit=8)
         _, local_url, _ = app.launch(
             prevent_thread_lock=True, server_port=7860,
             inbrowser=False, show_error=True,
